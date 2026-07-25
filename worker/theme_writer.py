@@ -71,7 +71,19 @@ def call_llm(memos: list[str]) -> dict | None:
     with urllib.request.urlopen(req, timeout=300) as res:
         payload = json.loads(res.read())
 
-    msg = payload["choices"][0]["message"]; text = (msg.get("content") or msg.get("reasoning") or "").strip()
+    msg = payload["choices"][0]["message"]
+    # DeepSeek の thinking 応答では content が null になり、reasoning に
+    # 本文が入ることがある。空文字も「本文なし」として reasoning を試す。
+    content = msg.get("content")
+    reasoning = msg.get("reasoning")
+    if isinstance(content, str) and content.strip():
+        text = content.strip()
+    elif isinstance(reasoning, str) and reasoning.strip():
+        text = reasoning.strip()
+    else:
+        # 未設定・空・想定外の型は従来どおり JSON 不正として扱い、呼び出し
+        # 側が次の周回で再試行できるよう例外を投げずに終了する。
+        text = ""
     # JSON だけを返せと言っても囲ってくる場合があるので保険
     if text.startswith("```"):
         text = text.strip("`")
