@@ -21,7 +21,7 @@ import urllib.request
 
 from common import REPO_ROOT, connect, read_theme_overrides, write_theme_markdown
 
-LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "http://gpu-node:8000/v1")
+LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "http://gpu-node:8000/v1").rstrip("/")
 LLM_MODEL = os.environ.get("LLM_MODEL", "deepseek-v4-flash")
 MAX_MEMOS_IN_PROMPT = 25
 SNIPPET_LEN = 200

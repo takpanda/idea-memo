@@ -85,6 +85,45 @@ docker compose --profile searxng up -d
 docker compose run --rm ingest python research_worker.py
 ```
 
+### LLM の切り替え (Ollama / vLLM)
+
+テーマ生成と調査ワーカーは、`.env` の `LLM_BASE_URL` と `LLM_MODEL` を共通で参照する。
+Mac-mini-M4Pro (192.168.1.102) の Ollama を使う例:
+
+```bash
+# Mac-mini-M4Pro 上で Ollama をインストール・常駐させる
+ollama serve
+ollama pull qwen2.5:7b
+
+# Pi 側の .env
+LLM_BASE_URL=http://192.168.1.102:11434/v1
+LLM_MODEL=qwen2.5:7b
+
+# Pi から OpenAI 互換 API を確認（本文は出力しない）
+docker compose run --rm ingest python check_llm.py
+```
+
+Ollama をLANから受け付けるには、Mac-mini-M4Pro上で `OLLAMA_HOST=0.0.0.0:11434`
+を設定してOllamaを再起動し、macOSファイアウォールでTCP 11434を許可する。
+実際の常駐設定は利用中のOllamaインストール方法に合わせること。
+
+テーマ生成の一次確認は、未命名またはメンバー変更済みのクラスタを用意したうえで、
+次の1パス実行を使う。`supervisor.py --once` は常駐せず、処理後に終了する。
+
+```bash
+started=$(date +%s)
+docker compose run --rm supervisor python supervisor.py --once
+test "$(find repo/themes -type f -newermt "@$started" | wc -l)" -ge 1
+```
+
+終了条件は、コマンドの終了コードが0で、`repo/themes/` に実行開始後に更新された
+Markdownが1件以上あること。調査ワーカーは `docker compose run --rm ingest python
+research_worker.py` が終了コード0で完了することを確認する。
+
+DGX Sparkへ戻す場合は `.env` を `LLM_BASE_URL=http://gpu-node:8000/v1` と
+`LLM_MODEL=deepseek-v4-flash` に戻し、`docker compose up -d --force-recreate supervisor scheduler`
+（または対象ワーカーの再起動）を実行する。Ollama側のモデル削除・停止は不要。
+
 ### 動作確認
 
 ```bash
