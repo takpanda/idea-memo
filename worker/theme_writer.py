@@ -78,8 +78,11 @@ def _parse_ollama_text(raw: bytes) -> str:
     contents = []
     for payload in payloads:
         message = payload.get("message") if isinstance(payload, dict) else None
-        content = message.get("content") if isinstance(message, dict) else None
-        if isinstance(content, str):
+        if not isinstance(message, dict):
+            continue
+        # Ollama の thinking モデルは content="" + thinking に本文が入る
+        content = message.get("content") or message.get("thinking") or ""
+        if content.strip():
             contents.append(content)
     return "".join(contents).strip()
 
