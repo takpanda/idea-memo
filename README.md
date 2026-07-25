@@ -63,9 +63,19 @@ docker compose run --rm ingest python -c \
 # {"status":"ok","model":"cl-nagoya/ruri-v3-310m","device":"mps","dim":768,...}
 ```
 
+### テスト
+
+Phase 1 の通し試験。Mac mini の 2 サービスと Telegram の file API は
+`tests/fake_services.py` が同じ HTTP 契約で代役を務めるので、実機もモデルも要らない。
+
+```bash
+pip install sqlite-vec
+python -m unittest discover -s tests
+```
+
 ## Phase
 
-1. **Phase 1** — Telegram 取り込み・音声文字起こし・埋め込み・類似メモ通知
+1. **Phase 1** — Telegram 取り込み・音声文字起こし・埋め込み・類似メモ通知（完了）
 2. **Phase 2** — HDBSCAN によるクラスタリング（ID 継承あり）・LLM によるテーマ命名
 3. **Phase 3** — テーマ単位の調査エージェント（先行事例・裏付け・反証を撃ち分け）・週次ダイジェスト
 

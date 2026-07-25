@@ -95,22 +95,42 @@ def store(db: sqlite3.Connection, row: sqlite3.Row, text: str) -> None:
         )
 
 
+def mark_silent(db: sqlite3.Connection, row: sqlite3.Row) -> None:
+    """発話が無い音声は空文字で確定させる。
+
+    NULL のままだと毎周回で拾い直して Whisper を無駄に回し続ける。
+    body は空のままなので埋め込みも通知も対象外になる。
+    """
+    with db:
+        db.execute(
+            "UPDATE attachments SET transcript = '', asr_model = ? WHERE id = ?",
+            (ASR_MODEL, row["attachment_id"]),
+        )
+
+
 def tick(db: sqlite3.Connection) -> int:
-    rows = fetch_pending(db)
-    if not rows:
-        return 0
-    for row in rows:
+    """戻り値は「前に進んだ件数」。
+
+    拾った件数を返すと、直せない添付 (ファイル欠損) が 1 つあるだけで
+    supervisor が毎周回 MAX_PASSES まで空回りする。
+    """
+    done = 0
+    for row in fetch_pending(db):
         path = REPO_ROOT / row["file_path"]
         if not path.exists():
+            # 人が戻すしかない。進捗として数えず、次の周回で再度気づく
             log.error("audio file missing: %s", path)
             continue
         text = post_audio(path)
         if not text:
             log.warning("empty transcript for idea %s", row["idea_id"])
+            mark_silent(db, row)
+            done += 1
             continue
         store(db, row, text)
         log.info("transcribed idea %s (%d chars)", row["idea_id"], len(text))
-    return len(rows)
+        done += 1
+    return done
 
 
 def main() -> None:

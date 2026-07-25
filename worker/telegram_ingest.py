@@ -135,6 +135,11 @@ def handle_message(db: sqlite3.Connection, msg: dict) -> None:
 
     path = markdown_path(uid, captured)
 
+    # ダウンロードはトランザクションの外でやる。中に入れると数十秒の
+    # 通信のあいだ書き込みロックを握り続け、supervisor 側が
+    # busy_timeout (5s) を超えて database is locked で落ちる
+    blob = download_voice(voice["file_id"], uid) if voice else None
+
     with db:
         cur = db.execute(
             """
@@ -158,8 +163,8 @@ def handle_message(db: sqlite3.Connection, msg: dict) -> None:
             return
         idea_id = cur.lastrowid
 
-        if voice:
-            local, size, digest = download_voice(voice["file_id"], uid)
+        if blob:
+            local, size, digest = blob
             db.execute(
                 """
                 INSERT INTO attachments(idea_id, kind, mime, bytes, file_path, meta_json)
@@ -273,30 +278,53 @@ def handle_finding_verdict(db: sqlite3.Connection, cq: dict, finding_id: int,
     log.info("finding %s -> %s", finding_id, verdict)
 
 
+def dispatch(db: sqlite3.Connection, update: dict) -> None:
+    if "message" in update:
+        handle_message(db, update["message"])
+    elif "edited_message" in update:
+        handle_edit(db, update["edited_message"])
+    elif "callback_query" in update:
+        handle_callback(db, update["callback_query"])
+
+
+def handle_updates(db: sqlite3.Connection, updates: list[dict]) -> None:
+    """1 件ずつ確定させる。途中で落ちても取りこぼさない。
+
+    処理できない 1 通で offset を止めると、以降のメモが全部入らなくなる。
+    通信起因なら次の周回に賭けて offset を据え置き、それ以外は
+    諦めて先に進む。捨てたことは黙らずにチャットへ返す
+    (メッセージ自体は Telegram に残るので送り直せる)。
+    """
+    for update in updates:
+        try:
+            dispatch(db, update)
+        except urllib.error.URLError:
+            raise                       # 一時的な障害。offset を進めない
+        except Exception as exc:
+            log.exception("update %s failed", update.get("update_id"))
+            try:
+                api("sendMessage", chat_id=CHAT_ID,
+                    text=f"⚠️ 取り込めませんでした ({type(exc).__name__})。"
+                         "送り直してください。")
+            except Exception:
+                log.warning("could not report ingest failure")
+
+        with db:
+            set_offset(db, update["update_id"] + 1)
+
+
 def main() -> None:
     db = connect()
     log.info("polling as chat %s", CHAT_ID)
 
     while True:
         try:
-            updates = api(
+            handle_updates(db, api(
                 "getUpdates",
                 offset=get_offset(db),
                 timeout=POLL_TIMEOUT,
                 allowed_updates=["message", "edited_message", "callback_query"],
-            )
-            for update in updates:
-                if "message" in update:
-                    handle_message(db, update["message"])
-                elif "edited_message" in update:
-                    handle_edit(db, update["edited_message"])
-                elif "callback_query" in update:
-                    handle_callback(db, update["callback_query"])
-
-                # 1 件ずつ確定させる。途中で落ちても取りこぼさない
-                with db:
-                    set_offset(db, update["update_id"] + 1)
-
+            ))
         except urllib.error.URLError as exc:
             log.warning("network error: %s", exc)
             time.sleep(5)

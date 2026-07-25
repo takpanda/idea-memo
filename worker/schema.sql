@@ -2,8 +2,10 @@
 -- idea-memo Phase 1 schema (SQLite + sqlite-vec + FTS5)
 --
 -- 原則:
---   正本は Markdown (Git 管理下)。この DB は再生成可能な索引。
---   ただし relations.verdict だけは人間の判断なので Markdown へ書き戻す。
+--   正本はこの DB。repo/ の Markdown は Obsidian で読むためのエクスポートで、
+--   書き込みは常に DB -> Markdown の一方向 (common.write_idea_markdown)。
+--   例外は clusters.name / name_locked だけで、テーマノートの front matter を
+--   人が直したものを読み戻す (common.read_theme_overrides)。
 -- ============================================================
 
 PRAGMA journal_mode = WAL;
