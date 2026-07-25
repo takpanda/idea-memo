@@ -25,6 +25,15 @@ Metal が見えないコンテナ内 VM で動くため）。launchd で常駐�
 ```
 worker/    Pi で Docker 常駐させるワーカー・バッチ・スキーマ
 macmini/   Mac-mini-M4Pro で launchd 常駐させる embed/transcribe サーバーと plist
+tests/     外部 (Telegram / LLM / 検索 / 埋め込み) だけを差し替えた通し試験
+```
+
+vault 側 (`repo/`) の中身:
+
+```
+ideas/YYYY/MM/  メモ 1 件 1 ファイル
+themes/         クラスタごとのテーマノート。集めた参考情報もここに載る
+digests/        週次ダイジェスト (YYYY-Www.md)
 ```
 
 ## セットアップ
@@ -55,6 +64,27 @@ launchctl load -w ~/Library/LaunchAgents/local.idea-memo.transcribe.plist
 sudo pmset -a sleep 0 disksleep 0   # スリープで文字起こしが止まらないように
 ```
 
+### 検索バックエンド (Phase 3)
+
+調査エージェントは Brave Search API か、自前の SearXNG を使う。
+`.env` の `SEARCH_BACKEND` で切り替える。
+
+```bash
+# Brave (既定)。無料枠でも週 1 回のバッチなら足りる
+SEARCH_BACKEND=brave BRAVE_API_KEY=...
+
+# 自前で持つ場合
+docker compose --profile searxng up -d
+# SEARCH_BACKEND=searxng SEARXNG_URL=http://searxng:8080
+```
+
+バッチは `worker/crontab` で回している (クラスタ再構成 毎日 4:00 /
+調査 日曜 3:00 / ダイジェスト 日曜 8:00)。手で回すなら:
+
+```bash
+docker compose run --rm ingest python research_worker.py
+```
+
 ### 動作確認
 
 ```bash
@@ -65,9 +95,9 @@ docker compose run --rm ingest python -c \
 
 ### テスト
 
-Phase 1 / Phase 2 の通し試験。Mac-mini-M4Pro の 2 サービス、GPU ノードの LLM、Telegram の
+Phase 1 / 2 / 3 の通し試験。Mac-mini-M4Pro の 2 サービス、GPU ノードの LLM、Telegram の
 file API は `tests/fake_services.py` が同じ HTTP 契約で代役を務めるので、
-実機もモデルも要らない。
+実機もモデルも要らない (検索バックエンドだけはモジュール関数を直接差し替える)。
 
 ```bash
 pip install sqlite-vec numpy scikit-learn
@@ -78,7 +108,7 @@ python -m unittest discover -s tests
 
 1. **Phase 1** — Telegram 取り込み・音声文字起こし・埋め込み・類似メモ通知（完了）
 2. **Phase 2** — HDBSCAN によるクラスタリング（ID 継承あり）・LLM によるテーマ命名（完了）
-3. **Phase 3** — テーマ単位の調査エージェント（先行事例・裏付け・反証を撃ち分け）・週次ダイジェスト
+3. **Phase 3** — テーマ単位の調査エージェント（先行事例・裏付け・反証を撃ち分け）・週次ダイジェスト（完了）
 
 テーマは **話題が 2 つ以上に分かれてから** 出る。HDBSCAN は木の根をクラスタとして
 選ばないため、似たメモばかりが数十件溜まっていても 1 話題のうちは全部「未分類」になる。

@@ -26,7 +26,15 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-from common import CHAT_ID, REPO_ROOT, TOKEN, api, connect, write_idea_markdown
+from common import (
+    CHAT_ID,
+    REPO_ROOT,
+    TOKEN,
+    api,
+    connect,
+    write_idea_markdown,
+    write_theme_markdown,
+)
 
 IDEA_DIR = REPO_ROOT / "ideas"
 BLOB_DIR = REPO_ROOT / "blobs"          # .gitignore 対象
@@ -270,6 +278,14 @@ def handle_finding_verdict(db: sqlite3.Connection, cq: dict, finding_id: int,
         db.execute(
             "UPDATE findings SET verdict = ? WHERE id = ?", (verdict, finding_id)
         )
+
+    # not_useful はテーマノートから消える。判断がそのまま見た目に出る
+    row = db.execute(
+        "SELECT cluster_id FROM findings WHERE id = ?", (finding_id,)
+    ).fetchone()
+    if row:
+        write_theme_markdown(db, row["cluster_id"])
+
     api(
         "answerCallbackQuery",
         callback_query_id=cq["id"],

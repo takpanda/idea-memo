@@ -12,11 +12,13 @@ import datetime as dt
 import json
 import logging
 import os
+import sqlite3
 import time
 import urllib.error
 import urllib.request
 
-from common import CHAT_ID, REPO_ROOT, api, connect
+import notify_worker
+from common import CHAT_ID, REPO_ROOT, STANCE_MARK, api, connect
 
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "http://gpu-node:8000/v1")
 LLM_MODEL = os.environ.get("LLM_MODEL", "deepseek-v4-flash")
@@ -24,8 +26,6 @@ DAYS = 7
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("digest-worker")
-
-STANCE_MARK = {"supports": "◯", "challenges": "▲", "neutral": "・"}
 
 
 def since() -> str:
@@ -56,23 +56,35 @@ def gather(db, cutoff: str) -> dict:
         (cutoff,),
     ).fetchall()
 
-    # 押されずに流れた関連候補。溜まっていたら閾値が合っていない兆候
-    undecided = db.execute(
-        """
-        SELECT COUNT(*) AS n FROM ideas i
-        WHERE  i.similar_notified_at >= ?
-               AND NOT EXISTS (SELECT 1 FROM relations r
-                               WHERE r.src_id = i.id OR r.dst_id = i.id)
-        """,
-        (cutoff,),
-    ).fetchone()["n"]
-
     return {
         "new_ideas": new_ideas,
         "new_clusters": new_clusters,
         "findings": findings,
-        "undecided": undecided,
+        "undecided": count_undecided(db, cutoff),
     }
+
+
+def count_undecided(db, cutoff: str) -> int:
+    """候補が出たのに押されずに流れたメモの数。溜まっていたら閾値が合っていない兆候。
+
+    「関連の提案は保存しない (毎回 ANN で出せる)」設計なので、何を通知したかは
+    DB に残っていない。数えるにはもう一度引き直すしかない。週 1 回・
+    その週に届いたメモの分だけなので、これで足りる。
+
+    通知済みフラグだけを見て relations の有無で数えると、候補ゼロで
+    フラグだけ立ったメモ (大半がこれ) を全部「判断待ち」にしてしまう。
+    """
+    rows = db.execute(
+        "SELECT id FROM ideas WHERE similar_notified_at >= ? AND status != 'archived'",
+        (cutoff,),
+    ).fetchall()
+
+    try:
+        return sum(1 for row in rows if notify_worker.find_similar(db, row["id"]))
+    except sqlite3.OperationalError as exc:
+        # ベクトル索引が引けない環境ではこの指標だけ落とす。ダイジェストは出す
+        log.warning("undecided count skipped: %s", exc)
+        return 0
 
 
 def write_intro(data: dict) -> str:
@@ -165,7 +177,7 @@ def render(data: dict, intro: str, week: str) -> tuple[str, str]:
         script.append(
             "今週新しく生まれたテーマは、"
             + "、".join(c["name"] for c in data["new_clusters"])
-            + " です。"
+            + "です。"
         )
     for f in data["findings"]:
         if f["stance"] == "challenges" and f["summary"]:
@@ -189,7 +201,7 @@ def render(data: dict, intro: str, week: str) -> tuple[str, str]:
 
 
 def main() -> None:
-    db = connect()
+    db = connect(with_vec=True)      # 判断待ちの再集計で ANN を引く
     now = dt.datetime.now(dt.timezone.utc)
     week = f"{now.isocalendar().year}-W{now.isocalendar().week:02d}"
 
