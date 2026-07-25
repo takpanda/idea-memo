@@ -18,6 +18,7 @@ import os
 import time
 import urllib.error
 import urllib.request
+from urllib.parse import urlsplit
 
 from common import REPO_ROOT, connect, read_theme_overrides, write_theme_markdown
 
@@ -50,40 +51,89 @@ Rules:
 """
 
 
+def _ollama_endpoint(base_url: str) -> str | None:
+    """11434 を指すベースURLをOllamaネイティブAPIのURLに変換する。"""
+    try:
+        parsed = urlsplit(base_url)
+        if parsed.port != 11434 or not parsed.scheme or not parsed.netloc:
+            return None
+    except ValueError:
+        return None
+    return f"{parsed.scheme}://{parsed.netloc}/api/chat"
+
+
+def _parse_ollama_text(raw: bytes) -> str:
+    """単一JSONまたはストリーミングNDJSONから応答本文を取り出す。"""
+    try:
+        payload = json.loads(raw)
+        payloads = [payload]
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        payloads = []
+        for line in raw.decode("utf-8", errors="replace").splitlines():
+            try:
+                payloads.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+
+    contents = []
+    for payload in payloads:
+        message = payload.get("message") if isinstance(payload, dict) else None
+        content = message.get("content") if isinstance(message, dict) else None
+        if isinstance(content, str):
+            contents.append(content)
+    return "".join(contents).strip()
+
+
 def call_llm(memos: list[str]) -> dict | None:
-    body = json.dumps(
-        {
-            "model": LLM_MODEL,
-            "messages": [
-                {"role": "system", "content": SYSTEM},
-                {"role": "user", "content": PROMPT.format(memos="\n".join(memos))},
-            ],
-            "temperature": 0.2,
-            "max_tokens": 2000,
-        }
-    ).encode("utf-8")
+    ollama_url = _ollama_endpoint(LLM_BASE_URL)
+    is_ollama = ollama_url is not None
+    request_body = {
+        "model": LLM_MODEL,
+        "messages": [
+            {"role": "system", "content": SYSTEM},
+            {"role": "user", "content": PROMPT.format(memos="\n".join(memos))},
+        ],
+    }
+    if is_ollama:
+        # OllamaのネイティブAPIでは構造化JSONとテンプレート無効化を
+        # トップレベルで指定する（/api/generateと同じAPI契約）。
+        request_body.update({
+            "format": "json",
+            "raw": True,
+            "options": {"temperature": 0.2, "num_predict": 2000},
+        })
+    else:
+        request_body.update({"temperature": 0.2, "max_tokens": 2000})
+
+    body = json.dumps(request_body).encode("utf-8")
 
     req = urllib.request.Request(
-        f"{LLM_BASE_URL}/chat/completions",
+        ollama_url if is_ollama else f"{LLM_BASE_URL}/chat/completions",
         data=body,
         headers={"Content-Type": "application/json"},
     )
     with urllib.request.urlopen(req, timeout=300) as res:
-        payload = json.loads(res.read())
+        raw = res.read()
 
-    msg = payload["choices"][0]["message"]
-    # DeepSeek の thinking 応答では content が null になり、reasoning に
-    # 本文が入ることがある。空文字も「本文なし」として reasoning を試す。
-    content = msg.get("content")
-    reasoning = msg.get("reasoning")
-    if isinstance(content, str) and content.strip():
-        text = content.strip()
-    elif isinstance(reasoning, str) and reasoning.strip():
-        text = reasoning.strip()
+    if is_ollama:
+        text = _parse_ollama_text(raw)
     else:
-        # 未設定・空・想定外の型は従来どおり JSON 不正として扱い、呼び出し
-        # 側が次の周回で再試行できるよう例外を投げずに終了する。
-        text = ""
+        try:
+            payload = json.loads(raw)
+            msg = payload["choices"][0]["message"]
+        except (UnicodeDecodeError, json.JSONDecodeError, KeyError, IndexError, TypeError):
+            return None
+
+        # DeepSeek の thinking 応答では content が null になり、reasoning に
+        # 本文が入ることがある。空文字も「本文なし」として reasoning を試す。
+        content = msg.get("content")
+        reasoning = msg.get("reasoning")
+        if isinstance(content, str) and content.strip():
+            text = content.strip()
+        elif isinstance(reasoning, str) and reasoning.strip():
+            text = reasoning.strip()
+        else:
+            text = ""
     # JSON だけを返せと言っても囲ってくる場合があるので保険
     if text.startswith("```"):
         text = text.strip("`")
@@ -94,7 +144,7 @@ def call_llm(memos: list[str]) -> dict | None:
         log.warning("LLM returned non-JSON: %s", text[:200])
         return None
 
-    if not isinstance(result.get("name"), str):
+    if not isinstance(result, dict) or not isinstance(result.get("name"), str):
         return None
     return result
 

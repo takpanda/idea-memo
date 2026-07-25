@@ -54,6 +54,45 @@ class ThemeWriterResponseTest(unittest.TestCase):
         with patch.object(theme_writer.urllib.request, "urlopen", return_value=FakeResponse(payload)):
             self.assertIsNone(theme_writer.call_llm(["memo"]))
 
+    def test_ollama_uses_native_chat_contract_and_strips_existing_base_path(self):
+        import theme_writer
+
+        payload = {"message": {"role": "assistant", "content": '{"name":"Ollama"}'}}
+        response = FakeResponse(payload)
+        with patch.object(theme_writer, "LLM_BASE_URL", "http://ollama.example:11434/v1/"), \
+             patch.object(theme_writer.urllib.request, "urlopen", return_value=response) as urlopen:
+            self.assertEqual(theme_writer.call_llm(["memo"])["name"], "Ollama")
+
+        request = urlopen.call_args.args[0]
+        self.assertEqual(request.full_url, "http://ollama.example:11434/api/chat")
+        body = json.loads(request.data)
+        self.assertEqual(body["format"], "json")
+        self.assertTrue(body["raw"])
+        self.assertEqual(body["model"], theme_writer.LLM_MODEL)
+
+    def test_ollama_ndjson_uses_message_content_from_all_chunks(self):
+        import theme_writer
+
+        response = FakeResponse({})
+        response.payload = (
+            json.dumps({"message": {"content": '{"name":"'}}) + "\n"
+            + json.dumps({"message": {"content": "ND" + '"}'}, "done": True})
+            + "\n"
+        ).encode("utf-8")
+        with patch.object(theme_writer, "LLM_BASE_URL", "http://127.0.0.1:11434"), \
+             patch.object(theme_writer.urllib.request, "urlopen", return_value=response):
+            self.assertEqual(theme_writer.call_llm(["memo"])["name"], "ND")
+
+    def test_ollama_invalid_or_empty_response_returns_none(self):
+        import theme_writer
+
+        for raw in (b"", b"not-json\n{broken"):
+            response = FakeResponse({})
+            response.payload = raw
+            with patch.object(theme_writer, "LLM_BASE_URL", "http://127.0.0.1:11434"), \
+                 patch.object(theme_writer.urllib.request, "urlopen", return_value=response):
+                self.assertIsNone(theme_writer.call_llm(["memo"]))
+
 
 class TelegramUrlContentTest(unittest.TestCase):
     @staticmethod
