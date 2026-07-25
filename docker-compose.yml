@@ -1,0 +1,104 @@
+# Pi 側の常駐ワーカーとバッチ。LLM (vLLM) は対象外で、外部エンドポイントとして参照する。
+#
+#   docker compose up -d                          # 推奨構成 (Mac mini の埋め込み/文字起こしを使う)
+#   docker compose --profile local-embed up -d    # 埋め込みも Pi の CPU で回す
+#   docker compose --profile searxng up -d        # 検索も自前で持つ
+
+x-worker: &worker
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: idea-memo/worker:latest
+  restart: unless-stopped
+  env_file: .env
+  environment:
+    IDEA_DB: /data/idea.db
+    IDEA_REPO: /repo
+    TZ: Asia/Tokyo
+  volumes:
+    # SQLite は必ずローカルファイルシステムに置く。
+    # NFS や SMB に置くとロックが壊れて WAL が飛ぶ
+    - ./data:/data
+    - ./repo:/repo
+  extra_hosts:
+    # コンテナ内では mDNS (.local) が引けないので IP で固定する。
+    # Mac mini 側は DHCP 予約か固定 IP にしておくこと
+    - "mac-mini.local:${MAC_MINI_IP:?MAC_MINI_IP is required}"
+  networks: [idea]
+  logging:
+    driver: json-file
+    options: { max-size: "10m", max-file: "3" }
+
+services:
+  # --- 常駐ワーカー -------------------------------------------------
+  ingest:
+    <<: *worker
+    container_name: idea-ingest
+    command: python telegram_ingest.py
+
+  # 文字起こし / 埋め込み / 類似通知 / テーマ生成をまとめて回す。
+  # どれも「欠けた派生データを埋める」同じ形なので分ける理由がない
+  supervisor:
+    <<: *worker
+    container_name: idea-supervisor
+    command: python supervisor.py
+
+  # --- UI -----------------------------------------------------------
+  # 検索とクラスタ俯瞰だけ。メモとテーマの閲覧は Obsidian で repo/ を開く
+  web:
+    <<: *worker
+    container_name: idea-web
+    command: uvicorn web:app --host 0.0.0.0 --port 8080
+    ports:
+      - "8080:8080"
+
+  # --- バッチ -------------------------------------------------------
+  # cluster / research / digest を crontab に従って実行する。
+  # cron を別コンテナにせず同一イメージで回すので、依存関係が二重にならない
+  scheduler:
+    <<: *worker
+    container_name: idea-scheduler
+    command: supercronic -passthrough-logs /app/crontab
+
+  # --- 完全 Docker 案でのみ起動 ---------------------------------------
+  embed:
+    build:
+      context: .
+      dockerfile: macmini/Dockerfile.embed
+    image: idea-memo/embed:latest
+    container_name: idea-embed
+    profiles: [local-embed]
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Tokyo
+    ports:
+      - "7997:7997"
+    volumes:
+      - hf-cache:/cache          # モデルを毎回落とし直さない
+    networks: [idea]
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request;urllib.request.urlopen('http://localhost:7997/health')"]
+      interval: 30s
+      timeout: 10s
+      start_period: 180s         # 初回はモデルのダウンロードがある
+      retries: 3
+
+  # --- 検索を自前で持つ場合 -------------------------------------------
+  searxng:
+    image: searxng/searxng:latest
+    container_name: idea-searxng
+    profiles: [searxng]
+    restart: unless-stopped
+    environment:
+      SEARXNG_BASE_URL: http://searxng:8080/
+    volumes:
+      - ./searxng:/etc/searxng
+    networks: [idea]
+
+networks:
+  idea:
+    driver: bridge
+
+volumes:
+  hf-cache:

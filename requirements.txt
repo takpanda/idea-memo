@@ -1,0 +1,6 @@
+# 初回ビルドが通ったら pip freeze で固定するのを勧める
+sqlite-vec>=0.1.6
+numpy>=1.26
+scikit-learn>=1.5
+fastapi
+uvicorn[standard]

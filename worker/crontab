@@ -1,0 +1,7 @@
+# supercronic 用。TZ は compose 側で Asia/Tokyo を渡している
+# クラスタ再構成 (毎日 4:00)
+0 4 * * *   python /app/cluster_worker.py
+# 調査 (日曜 3:00)
+0 3 * * 0   python /app/research_worker.py
+# 週次ダイジェスト (日曜 8:00)
+0 8 * * 0   python /app/digest_worker.py

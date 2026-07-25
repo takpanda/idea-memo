@@ -1,0 +1,6 @@
+# torch は Dockerfile.embed で CPU 版を先に入れてある
+transformers>=4.48.0
+sentence-transformers>=3.0
+sentencepiece
+fastapi
+uvicorn[standard]

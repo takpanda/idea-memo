@@ -1,0 +1,10 @@
+.env
+data/
+repo/
+logs/
+searxng/
+__pycache__/
+*.pyc
+*.db
+*.db-wal
+*.db-shm
