@@ -261,6 +261,8 @@ INDEX = """<!doctype html>
   .tag { font-size:.75rem; border:1px solid var(--line); border-radius:99px; padding:.05rem .5rem; }
   .stance-challenges { color:#e0642f; }
   .stance-supports { color:#2e9e5b; }
+  /* 不要と判断した参考情報。テーマノートからは消えるが、俯瞰では残す */
+  .dropped { opacity:.45; }
   a { color:var(--accent); }
   .empty { color:var(--dim); padding:2rem 0; }
   .actions button { font-size:.75rem; margin-right:.4rem; cursor:pointer;
@@ -357,7 +359,7 @@ async function loadCluster(uid, btn) {
   const d = await (await fetch(`/api/clusters/${uid}`)).json();
   box.innerHTML =
     d.findings.map(f => `
-      <div class="card" style="border:none;padding:.4rem 0">
+      <div class="card ${f.verdict === "not_useful" ? "dropped" : ""}" style="border:none;padding:.4rem 0">
         <span class="stance-${f.stance}">${f.stance === "challenges" ? "▲" : f.stance === "supports" ? "◯" : "・"}</span>
         <a href="${f.url}" target="_blank" rel="noreferrer">${esc(f.title)}</a>
         <div class="meta">${esc(f.summary)}</div>

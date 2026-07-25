@@ -18,6 +18,9 @@ REPO_ROOT = Path(os.environ.get("IDEA_REPO", "."))
 
 API = f"https://api.telegram.org/bot{TOKEN}"
 
+# 参考情報のスタンス表示。Telegram・Markdown・ダイジェストで揃える
+STANCE_MARK = {"supports": "◯", "challenges": "▲", "neutral": "・"}
+
 
 def connect(with_vec: bool = False) -> sqlite3.Connection:
     db = sqlite3.connect(DB_PATH)
@@ -198,6 +201,17 @@ def write_theme_markdown(db: sqlite3.Connection, cluster_id: int) -> Path | None
             tuple(ids),
         ).fetchall()
 
+    # Phase 3。不要と判断されたものは載せない (判断を尊重しないと二度と押されなくなる)
+    findings = db.execute(
+        """
+        SELECT title, url, site, summary, stance, verdict
+        FROM   findings
+        WHERE  cluster_id = ? AND (verdict IS NULL OR verdict = 'useful')
+        ORDER BY stance = 'challenges' DESC, fetched_at DESC
+        """,
+        (cluster_id,),
+    ).fetchall()
+
     lines = [
         "---",
         f"cluster_uid: {cluster['uid']}",
@@ -228,6 +242,17 @@ def write_theme_markdown(db: sqlite3.Connection, cluster_id: int) -> Path | None
         snippet = flat[:80] + ("…" if len(flat) > 80 else "")
         lines.append(f"- `{m['captured_at'][:10]}` [{snippet}]({m['file_path']})")
     lines.append("")
+
+    if findings:
+        lines += ["## 参考情報", ""]
+        for f in findings:
+            mark = STANCE_MARK.get(f["stance"], "・")
+            title = f["title"] or f["url"]
+            checked = " ✓" if f["verdict"] == "useful" else ""
+            lines.append(f"- {mark} [{title}]({f['url']}) — {f['site'] or ''}{checked}")
+            if f["summary"]:
+                lines.append(f"  {f['summary']}")
+        lines += ["", "◯ 裏付け / ▲ 反証・注意点 / ・ 参考 (✓ は役に立ったと判断済み)", ""]
 
     path = REPO_ROOT / cluster["file_path"]
     path.parent.mkdir(parents=True, exist_ok=True)
