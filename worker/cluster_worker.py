@@ -24,7 +24,7 @@ import numpy as np
 import sqlite_vec
 from sklearn.cluster import HDBSCAN
 
-from common import connect
+from common import connect, write_theme_markdown
 
 VEC_TABLE = "vec_ideas_ruri_v3_310m_topic"
 
@@ -100,18 +100,23 @@ def cluster(mat: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 # ------------------------------------------------------------
 # クラスタ ID の引き継ぎ
 # ------------------------------------------------------------
-def previous_members(db) -> dict[int, set[int]]:
+def previous_members(db) -> tuple[dict[int, set[int]], set[int]]:
+    """(cluster_id -> 前回のメンバー集合, そのうち開いているもの)
+
+    閉じたクラスタも候補に入れる。話題が数か月止まってから戻ってきたとき、
+    新しい id を振ると名前も調査履歴も切れてしまうため。
+    idea_clusters は 1 メモ 1 行 (idea_id が PRIMARY KEY) で閉じたクラスタの
+    メンバーを残しておけないので、集合そのものを clusters に持たせている。
+    """
     prev: dict[int, set[int]] = {}
+    live: set[int] = set()
     for row in db.execute(
-        """
-        SELECT ic.cluster_id, ic.idea_id
-        FROM   idea_clusters ic
-               JOIN clusters c ON c.id = ic.cluster_id
-        WHERE  c.closed_at IS NULL
-        """
+        "SELECT id, members_json, closed_at FROM clusters WHERE members_json IS NOT NULL"
     ):
-        prev.setdefault(row["cluster_id"], set()).add(row["idea_id"])
-    return prev
+        prev[row["id"]] = set(json.loads(row["members_json"]))
+        if row["closed_at"] is None:
+            live.add(row["id"])
+    return prev, live
 
 
 def jaccard(a: set[int], b: set[int]) -> float:
@@ -150,7 +155,7 @@ def match_clusters(
 # 書き込み
 # ------------------------------------------------------------
 def persist(db, new: dict[int, set[int]], probs: dict[int, float]) -> tuple[int, int]:
-    prev = previous_members(db)
+    prev, was_open = previous_members(db)
     mapping = match_clusters(prev, new)
 
     n_new = 0
@@ -161,19 +166,21 @@ def persist(db, new: dict[int, set[int]], probs: dict[int, float]) -> tuple[int,
 
         live: set[int] = set()
         for label, members in new.items():
+            ids_json = json.dumps(sorted(members))
             cluster_id = mapping.get(label)
             if cluster_id is None:
                 cur = db.execute(
-                    "INSERT INTO clusters(uid, size, member_hash) VALUES (?, ?, ?)",
-                    (ulid(), len(members), member_hash(members)),
+                    "INSERT INTO clusters(uid, size, member_hash, members_json) "
+                    "VALUES (?, ?, ?, ?)",
+                    (ulid(), len(members), member_hash(members), ids_json),
                 )
                 cluster_id = cur.lastrowid
                 n_new += 1
             else:
                 db.execute(
-                    f"UPDATE clusters SET size = ?, member_hash = ?, "
+                    f"UPDATE clusters SET size = ?, member_hash = ?, members_json = ?, "
                     f"updated_at = {now}, closed_at = NULL WHERE id = ?",
-                    (len(members), member_hash(members), cluster_id),
+                    (len(members), member_hash(members), ids_json, cluster_id),
                 )
             live.add(cluster_id)
 
@@ -183,13 +190,18 @@ def persist(db, new: dict[int, set[int]], probs: dict[int, float]) -> tuple[int,
                 [(i, cluster_id, probs.get(i)) for i in sorted(members)],
             )
 
-        # 消えたクラスタは削除せず閉じる。名前と履歴は残す
-        stale = [cid for cid in prev if cid not in live]
+        # 消えたクラスタは削除せず閉じる。名前と履歴とメンバー集合は残す
+        stale = [cid for cid in was_open if cid not in live]
         if stale:
             db.executemany(
                 f"UPDATE clusters SET closed_at = {now}, size = 0 WHERE id = ?",
                 [(cid,) for cid in stale],
             )
+
+    # 開閉が変わったテーマノートは書き直す。閉じたものが Obsidian で
+    # 現役のまま見えていると、消えた話題を追いかけることになる
+    for cluster_id in stale + [c for c in live if c in prev and c not in was_open]:
+        write_theme_markdown(db, cluster_id)
 
     return n_new, len(stale)
 

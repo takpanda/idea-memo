@@ -182,6 +182,10 @@ CREATE TABLE clusters (
   size               INTEGER NOT NULL DEFAULT 0,
   member_hash        TEXT,                        -- 現在のメンバー集合の SHA-256
   named_member_hash  TEXT,                        -- 命名・要約したときのメンバー集合
+  -- 最後に見たメンバーの idea_id (JSON 配列)。idea_clusters は 1 メモ 1 行
+  -- なので閉じたクラスタのメンバーを残せない。再結成したときに
+  -- この集合と照合して id を引き継ぐ
+  members_json       TEXT,
   researched_at         TEXT,                     -- 最後に調査した日時 (Phase 3)
   researched_member_hash TEXT,                    -- 調査したときのメンバー集合
   file_path          TEXT,                        -- themes/<uid>.md

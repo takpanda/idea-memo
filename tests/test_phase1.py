@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "worker"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from fake_services import FakeServices  # noqa: E402
+from fake_services import FakeServices, fresh_worker_imports  # noqa: E402
 
 CHAT_ID = 424242
 
@@ -59,6 +59,8 @@ def setUpModule() -> None:
         "TRANSCRIBE_URL": f"{services.base}/transcribe",
         "SIM_THRESHOLD": "0.82",
     })
+
+    fresh_worker_imports()
 
     import init_db
     assert init_db.main() == 0, "init_db failed"

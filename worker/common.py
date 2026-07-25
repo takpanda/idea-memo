@@ -115,6 +115,24 @@ def write_idea_markdown(db: sqlite3.Connection, idea_id: int) -> Path | None:
 # ------------------------------------------------------------
 # テーマノート (Phase 2)
 # ------------------------------------------------------------
+def yaml_value(text: str) -> str:
+    """front matter の 1 行に載せる値。
+
+    テーマ名は LLM も人も自由に書くので、`メモ: 整理` のようにコロンが
+    入ると front matter ごと壊れる。常に引用して逃がす。
+    """
+    flat = " ".join(text.split())
+    return '"' + flat.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def unquote_yaml(value: str) -> str:
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        value = value[1:-1]
+        if value and '\\' in value:
+            value = value.replace('\\"', '"').replace("\\\\", "\\")
+    return value
+
+
 def read_theme_overrides(path: Path) -> dict:
     """既存のテーマノートから人の編集を読み戻す。
 
@@ -135,7 +153,7 @@ def read_theme_overrides(path: Path) -> dict:
         if line.startswith("  "):          # ネストした members: は見ない
             continue
         key, _, value = line.partition(":")
-        key, value = key.strip(), value.strip()
+        key, value = key.strip(), unquote_yaml(value.strip())
         if key == "name" and value:
             overrides["name"] = value
         elif key == "name_locked":
@@ -147,12 +165,13 @@ def read_theme_overrides(path: Path) -> dict:
 def write_theme_markdown(db: sqlite3.Connection, cluster_id: int) -> Path | None:
     cluster = db.execute(
         """
-        SELECT uid, name, name_locked, summary, size, file_path, updated_at
+        SELECT uid, name, name_locked, summary, size, file_path, updated_at,
+               closed_at, members_json
         FROM   clusters WHERE id = ?
         """,
         (cluster_id,),
     ).fetchone()
-    if cluster is None:
+    if cluster is None or not cluster["file_path"]:
         return None
 
     members = db.execute(
@@ -166,20 +185,39 @@ def write_theme_markdown(db: sqlite3.Connection, cluster_id: int) -> Path | None
         (cluster_id,),
     ).fetchall()
 
+    ids = json.loads(cluster["members_json"] or "[]")
+    if cluster["closed_at"] and not members and ids:
+        # 閉じたクラスタは割当が消えている。最後に見たメンバーを載せて、
+        # 「何が集まっていた話題だったのか」を追えるようにしておく
+        members = db.execute(
+            f"""
+            SELECT uid, body, captured_at, file_path, NULL AS probability
+            FROM   ideas WHERE id IN ({','.join('?' * len(ids))})
+            ORDER BY captured_at
+            """,
+            tuple(ids),
+        ).fetchall()
+
     lines = [
         "---",
         f"cluster_uid: {cluster['uid']}",
-        f"name: {cluster['name'] or ''}",
+        f"name: {yaml_value(cluster['name'] or '')}",
         f"name_locked: {'true' if cluster['name_locked'] else 'false'}",
-        f"size: {cluster['size']}",
+        f"size: {len(members)}",
         f"updated_at: {cluster['updated_at']}",
-        "members:",
     ]
+    if cluster["closed_at"]:
+        lines.append(f"closed_at: {cluster['closed_at']}")
+    lines.append("members:")
     lines += [f"  - uid: {m['uid']}" for m in members]
     lines += ["---", ""]
 
     lines.append(f"# {cluster['name'] or '(未命名)'}")
     lines.append("")
+    if cluster["closed_at"]:
+        lines += [f"> {cluster['closed_at'][:10]} にこのテーマは解散した"
+                  "（以下は解散時点のメンバー）。同じ話題が戻ってくれば同じテーマに戻る。",
+                  ""]
     if cluster["summary"]:
         lines += [cluster["summary"], ""]
 
