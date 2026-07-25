@@ -395,8 +395,16 @@ def handle_updates(db: sqlite3.Connection, updates: list[dict]) -> None:
     for update in updates:
         try:
             dispatch(db, update)
-        except urllib.error.URLError:
-            raise                       # 一時的な障害。offset を進めない
+        except urllib.error.URLError as exc:
+            if not isinstance(exc, urllib.error.HTTPError):
+                raise                   # 一時的な障害。offset を進めない
+            log.exception("update %s failed", update.get("update_id"))
+            try:
+                api("sendMessage", chat_id=CHAT_ID,
+                    text=f"⚠️ 取り込めませんでした ({type(exc).__name__})。"
+                         "送り直してください。")
+            except Exception:
+                log.warning("could not report ingest failure")
         except Exception as exc:
             log.exception("update %s failed", update.get("update_id"))
             try:

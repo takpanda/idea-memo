@@ -9,6 +9,7 @@ import sys
 import tempfile
 import types
 import unittest
+import urllib.error
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -82,6 +83,33 @@ class TelegramUrlContentTest(unittest.TestCase):
         self.assertIn("タイトル: Example & title", content)
         self.assertIn("見出し 本文です。", content)
         self.assertNotIn("secret", content)
+
+    def test_http_error_is_reported_and_offset_advances(self):
+        import telegram_ingest
+
+        db = sqlite3.connect(":memory:")
+        db.row_factory = sqlite3.Row
+        db.execute("CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT, updated_at TEXT)")
+        sent = []
+        error = urllib.error.HTTPError(
+            "https://example.com/missing", 404, "Not Found", {}, None
+        )
+
+        with patch.object(telegram_ingest, "dispatch",
+                          side_effect=lambda db, update: telegram_ingest.fetch_url_content(
+                              "https://example.com/missing"
+                          )), patch.object(telegram_ingest.urllib.request,
+                                           "urlopen", side_effect=error), \
+             patch.object(telegram_ingest, "api",
+                          side_effect=lambda method, **params: sent.append(
+                              {"method": method, **params})):
+            telegram_ingest.handle_updates(db, [{"update_id": 41}])
+
+        self.assertEqual(db.execute("SELECT value FROM kv WHERE key = 'telegram_offset'")
+                         .fetchone()[0], "42")
+        self.assertEqual(sent[0]["method"], "sendMessage")
+        self.assertIn("取り込めませんでした", sent[0]["text"])
+        db.close()
 
 
 class ExistingDatabaseMigrationTest(unittest.TestCase):
