@@ -71,7 +71,7 @@ def call_llm(memos: list[str]) -> dict | None:
     with urllib.request.urlopen(req, timeout=180) as res:
         payload = json.loads(res.read())
 
-    text = payload["choices"][0]["message"]["content"].strip()
+    msg = payload["choices"][0]["message"]; text = (msg.get("content") or msg.get("reasoning") or "").strip()
     # JSON だけを返せと言っても囲ってくる場合があるので保険
     if text.startswith("```"):
         text = text.strip("`")
