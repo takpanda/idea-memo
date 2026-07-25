@@ -26,7 +26,7 @@ import urllib.request
 
 from common import connect, write_theme_markdown
 
-LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "http://gpu-node:8000/v1")
+LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "http://gpu-node:8000/v1").rstrip("/")
 LLM_MODEL = os.environ.get("LLM_MODEL", "deepseek-v4-flash")
 
 SEARCH_BACKEND = os.environ.get("SEARCH_BACKEND", "brave")   # 'brave' | 'searxng'

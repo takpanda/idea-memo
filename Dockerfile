@@ -25,7 +25,8 @@ RUN pip install -r requirements.txt
 
 COPY worker/common.py worker/telegram_ingest.py worker/transcribe_worker.py worker/embed_worker.py \
      worker/notify_worker.py worker/cluster_worker.py worker/theme_writer.py worker/research_worker.py \
-     worker/digest_worker.py worker/supervisor.py worker/web.py worker/init_db.py worker/schema.sql worker/crontab ./
+     worker/digest_worker.py worker/check_llm.py worker/supervisor.py worker/web.py worker/init_db.py \
+     worker/schema.sql worker/crontab ./
 
 # ボリュームの所有者と揃える。Pi のデフォルトユーザーが 1000
 RUN useradd -m -u 1000 app && chown -R app:app /app
