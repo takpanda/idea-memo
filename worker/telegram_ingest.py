@@ -16,14 +16,17 @@ Pi を外に出さずに済む。
 """
 
 import hashlib
+import html
 import json
 import logging
+import re
 import secrets
 import sqlite3
 import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
+from html.parser import HTMLParser
 from pathlib import Path
 
 from common import (
@@ -42,6 +45,81 @@ BLOB_DIR = REPO_ROOT / "blobs"          # .gitignore 対象
 FILE_API = f"https://api.telegram.org/file/bot{TOKEN}"
 POLL_TIMEOUT = 50
 MAX_FILE_BYTES = 20 * 1024 * 1024       # Bot API のダウンロード上限
+MAX_PAGE_BYTES = 2 * 1024 * 1024       # URL本文の取得上限
+PAGE_TIMEOUT = 30
+URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
+
+
+class _PageTextParser(HTMLParser):
+    """HTMLからタイトルと可視テキストだけを取り出す。"""
+
+    _IGNORED_TAGS = {"script", "style", "noscript", "template", "svg"}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.title_parts: list[str] = []
+        self.text_parts: list[str] = []
+        self._ignored_depth = 0
+        self._in_title = False
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag = tag.lower()
+        if tag in self._IGNORED_TAGS:
+            self._ignored_depth += 1
+        elif tag == "title" and self._ignored_depth == 0:
+            self._in_title = True
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        if tag in self._IGNORED_TAGS and self._ignored_depth:
+            self._ignored_depth -= 1
+        elif tag == "title":
+            self._in_title = False
+
+    def handle_data(self, data: str) -> None:
+        if self._ignored_depth:
+            return
+        value = " ".join(data.split())
+        if not value:
+            return
+        if self._in_title:
+            self.title_parts.append(value)
+        else:
+            self.text_parts.append(value)
+
+
+def extract_url(text: str) -> str | None:
+    """メッセージから最初のHTTP(S) URLを取り出す。"""
+    match = URL_RE.search(text)
+    if not match:
+        return None
+    return match.group(0).rstrip(".,!?;:)]}、。")
+
+
+def fetch_url_content(url: str) -> str:
+    """URLのタイトルと可視本文を取得し、アイデア本文用の文字列を返す。"""
+    request = urllib.request.Request(
+        url,
+        headers={"User-Agent": "idea-memo/1.0"},
+    )
+    with urllib.request.urlopen(request, timeout=PAGE_TIMEOUT) as response:
+        data = response.read(MAX_PAGE_BYTES + 1)
+        if len(data) > MAX_PAGE_BYTES:
+            raise RuntimeError("URL content is too large")
+        charset = response.headers.get_content_charset() if response.headers else None
+    source = data.decode(charset or "utf-8", errors="replace")
+    parser = _PageTextParser()
+    parser.feed(source)
+    title = " ".join(parser.title_parts).strip()
+    body = " ".join(parser.text_parts).strip()
+    if not title and not body:
+        raise RuntimeError("URL content is empty")
+    lines = [f"URL: {url}"]
+    if title:
+        lines.append(f"タイトル: {html.unescape(title)}")
+    if body:
+        lines.append(body)
+    return "\n\n".join(lines)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("telegram-ingest")
@@ -137,6 +215,9 @@ def handle_message(db: sqlite3.Connection, msg: dict) -> None:
     elif msg.get("text"):
         input_kind = "text"
         body = msg["text"]
+        url = extract_url(body)
+        if url:
+            body = fetch_url_content(url)
     else:
         log.info("unsupported message type, skipped: %s", source_ref)
         return
@@ -314,8 +395,16 @@ def handle_updates(db: sqlite3.Connection, updates: list[dict]) -> None:
     for update in updates:
         try:
             dispatch(db, update)
-        except urllib.error.URLError:
-            raise                       # 一時的な障害。offset を進めない
+        except urllib.error.URLError as exc:
+            if not isinstance(exc, urllib.error.HTTPError):
+                raise                   # 一時的な障害。offset を進めない
+            log.exception("update %s failed", update.get("update_id"))
+            try:
+                api("sendMessage", chat_id=CHAT_ID,
+                    text=f"⚠️ 取り込めませんでした ({type(exc).__name__})。"
+                         "送り直してください。")
+            except Exception:
+                log.warning("could not report ingest failure")
         except Exception as exc:
             log.exception("update %s failed", update.get("update_id"))
             try:

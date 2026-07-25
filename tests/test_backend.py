@@ -9,6 +9,7 @@ import sys
 import tempfile
 import types
 import unittest
+import urllib.error
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -27,8 +28,8 @@ class FakeResponse:
     def __exit__(self, *args):
         return False
 
-    def read(self):
-        return self.payload
+    def read(self, size=-1):
+        return self.payload if size < 0 else self.payload[:size]
 
 
 class ThemeWriterResponseTest(unittest.TestCase):
@@ -52,6 +53,195 @@ class ThemeWriterResponseTest(unittest.TestCase):
         payload = {"choices": [{"message": {"content": None, "reasoning": None}}]}
         with patch.object(theme_writer.urllib.request, "urlopen", return_value=FakeResponse(payload)):
             self.assertIsNone(theme_writer.call_llm(["memo"]))
+
+
+class TelegramUrlContentTest(unittest.TestCase):
+    @staticmethod
+    def _db():
+        db = sqlite3.connect(":memory:")
+        db.row_factory = sqlite3.Row
+        db.executescript(
+            """
+            CREATE TABLE kv (
+                key TEXT PRIMARY KEY, value TEXT, updated_at TEXT
+            );
+            CREATE TABLE ideas (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                uid TEXT NOT NULL,
+                body TEXT NOT NULL,
+                captured_at TEXT NOT NULL,
+                source TEXT NOT NULL,
+                source_ref TEXT,
+                input_kind TEXT NOT NULL,
+                parent_id INTEGER,
+                file_path TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'inbox'
+            );
+            CREATE UNIQUE INDEX idx_test_ideas_source_ref
+                ON ideas(source, source_ref) WHERE source_ref IS NOT NULL;
+            """
+        )
+        return db
+
+    @staticmethod
+    def _page_response():
+        response = FakeResponse({})
+        response.payload = (
+            "<html><head><title>登録対象</title></head>"
+            "<body><p>URLから取得した本文です。</p></body></html>"
+        ).encode("utf-8")
+        response.headers = SimpleNamespace(
+            get_content_charset=lambda: "utf-8"
+        )
+        return response
+
+    @staticmethod
+    def _message(message_id=1):
+        return {
+            "message_id": message_id,
+            "date": 1_760_000_000,
+            "chat": {"id": 0},
+            "text": "https://example.com/article",
+        }
+
+    def test_extract_url_trims_sentence_punctuation(self):
+        import telegram_ingest
+
+        self.assertEqual(
+            telegram_ingest.extract_url("参考 https://example.com/page。"),
+            "https://example.com/page",
+        )
+
+    def test_fetch_url_content_extracts_title_and_visible_text(self):
+        import telegram_ingest
+
+        response = FakeResponse({})
+        response.payload = (
+            "<html><head><title>Example &amp; title</title></head>"
+            "<body><h1>見出し</h1><p>本文です。</p><script>secret()</script>"
+            "</body></html>"
+        ).encode("utf-8")
+        response.headers = SimpleNamespace(
+            get_content_charset=lambda: "utf-8"
+        )
+        with patch.object(telegram_ingest.urllib.request, "urlopen", return_value=response):
+            content = telegram_ingest.fetch_url_content("https://example.com/page")
+
+        self.assertIn("URL: https://example.com/page", content)
+        self.assertIn("タイトル: Example & title", content)
+        self.assertIn("見出し 本文です。", content)
+        self.assertNotIn("secret", content)
+
+    def test_http_error_is_reported_and_offset_advances(self):
+        import telegram_ingest
+
+        db = sqlite3.connect(":memory:")
+        db.row_factory = sqlite3.Row
+        db.execute("CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT, updated_at TEXT)")
+        sent = []
+        error = urllib.error.HTTPError(
+            "https://example.com/missing", 404, "Not Found", {}, None
+        )
+
+        with patch.object(telegram_ingest, "dispatch",
+                          side_effect=lambda db, update: telegram_ingest.fetch_url_content(
+                              "https://example.com/missing"
+                          )), patch.object(telegram_ingest.urllib.request,
+                                           "urlopen", side_effect=error), \
+             patch.object(telegram_ingest, "api",
+                          side_effect=lambda method, **params: sent.append(
+                              {"method": method, **params})):
+            telegram_ingest.handle_updates(db, [{"update_id": 41}])
+
+        self.assertEqual(db.execute("SELECT value FROM kv WHERE key = 'telegram_offset'")
+                         .fetchone()[0], "42")
+        self.assertEqual(sent[0]["method"], "sendMessage")
+        self.assertIn("取り込めませんでした", sent[0]["text"])
+        db.close()
+
+    def test_url_message_is_registered_with_fetched_content(self):
+        import telegram_ingest
+
+        db = self._db()
+        written = []
+        with patch.object(telegram_ingest.urllib.request, "urlopen",
+                          return_value=self._page_response()), \
+             patch.object(telegram_ingest, "write_idea_markdown",
+                          side_effect=lambda db, idea_id: written.append(idea_id)):
+            telegram_ingest.handle_updates(db, [{
+                "update_id": 50,
+                "message": self._message(),
+            }])
+
+        idea = db.execute(
+            "SELECT body, input_kind, source, source_ref FROM ideas"
+        ).fetchone()
+        self.assertEqual(idea["input_kind"], "text")
+        self.assertEqual(idea["source"], "telegram")
+        self.assertEqual(idea["source_ref"], "0:1")
+        self.assertIn("タイトル: 登録対象", idea["body"])
+        self.assertIn("URLから取得した本文です。", idea["body"])
+        self.assertEqual(written, [1])
+        self.assertEqual(db.execute(
+            "SELECT value FROM kv WHERE key = 'telegram_offset'"
+        ).fetchone()[0], "51")
+        db.close()
+
+    def test_database_registration_failure_is_reported_and_offset_advances(self):
+        import telegram_ingest
+
+        db = self._db()
+        db.executescript(
+            """
+            CREATE TRIGGER reject_idea BEFORE INSERT ON ideas
+            BEGIN
+                SELECT RAISE(ABORT, 'database registration failed');
+            END;
+            """
+        )
+        sent = []
+        with patch.object(telegram_ingest.urllib.request, "urlopen",
+                          return_value=self._page_response()), \
+             patch.object(telegram_ingest, "api",
+                          side_effect=lambda method, **params: sent.append(
+                              {"method": method, **params})):
+            telegram_ingest.handle_updates(db, [{
+                "update_id": 60,
+                "message": self._message(2),
+            }])
+
+        self.assertEqual(sent[0]["method"], "sendMessage")
+        self.assertIn("取り込めませんでした", sent[0]["text"])
+        self.assertEqual(db.execute(
+            "SELECT value FROM kv WHERE key = 'telegram_offset'"
+        ).fetchone()[0], "61")
+        self.assertEqual(db.execute("SELECT COUNT(*) FROM ideas").fetchone()[0], 0)
+        db.close()
+
+    def test_markdown_write_failure_is_reported_and_offset_advances(self):
+        import telegram_ingest
+
+        db = self._db()
+        sent = []
+        with patch.object(telegram_ingest.urllib.request, "urlopen",
+                          return_value=self._page_response()), \
+             patch.object(telegram_ingest, "write_idea_markdown",
+                          side_effect=OSError("markdown write failed")), \
+             patch.object(telegram_ingest, "api",
+                          side_effect=lambda method, **params: sent.append(
+                              {"method": method, **params})):
+            telegram_ingest.handle_updates(db, [{
+                "update_id": 70,
+                "message": self._message(3),
+            }])
+
+        self.assertEqual(sent[0]["method"], "sendMessage")
+        self.assertIn("取り込めませんでした", sent[0]["text"])
+        self.assertEqual(db.execute(
+            "SELECT value FROM kv WHERE key = 'telegram_offset'"
+        ).fetchone()[0], "71")
+        self.assertEqual(db.execute("SELECT COUNT(*) FROM ideas").fetchone()[0], 1)
+        db.close()
 
 
 class ExistingDatabaseMigrationTest(unittest.TestCase):
