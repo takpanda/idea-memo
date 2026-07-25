@@ -59,7 +59,7 @@ def call_llm(memos: list[str]) -> dict | None:
                 {"role": "user", "content": PROMPT.format(memos="\n".join(memos))},
             ],
             "temperature": 0.2,
-            "max_tokens": 400,
+            "max_tokens": 2000,
         }
     ).encode("utf-8")
 
