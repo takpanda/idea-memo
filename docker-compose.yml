@@ -1,6 +1,6 @@
 # Pi 側の常駐ワーカーとバッチ。LLM (vLLM) は対象外で、外部エンドポイントとして参照する。
 #
-#   docker compose up -d                          # 推奨構成 (Mac mini の埋め込み/文字起こしを使う)
+#   docker compose up -d                          # 推奨構成 (Mac-mini-M4Pro の埋め込み/文字起こしを使う)
 #   docker compose --profile local-embed up -d    # 埋め込みも Pi の CPU で回す
 #   docker compose --profile searxng up -d        # 検索も自前で持つ
 
@@ -22,7 +22,7 @@ x-worker: &worker
     - ./repo:/repo
   extra_hosts:
     # コンテナ内では mDNS (.local) が引けないので IP で固定する。
-    # Mac mini 側は DHCP 予約か固定 IP にしておくこと
+    # Mac-mini-M4Pro 側は DHCP 予約か固定 IP にしておくこと
     - "mac-mini.local:${MAC_MINI_IP:?MAC_MINI_IP is required}"
   networks: [idea]
   logging:

@@ -2,7 +2,7 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  Whisper 文字起こしサービス (Mac mini)
+  Whisper 文字起こしサービス (Mac-mini-M4Pro)
 
   設置:
     cp macmini/local.idea-memo.transcribe.plist ~/Library/LaunchAgents/

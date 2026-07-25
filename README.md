@@ -12,11 +12,11 @@
 
 ```
 Pi (Docker)   ingest / supervisor / web / scheduler
-Mac mini      embed_server:7997 (ruri-v3-310m) / transcribe_server:7998 (Whisper)
+Mac-mini-M4Pro    embed_server:7997 (ruri-v3-310m) / transcribe_server:7998 (Whisper)
 GPU ノード     vLLM (テーマ命名・要約・調査クエリ生成、Docker 対象外)
 ```
 
-Mac mini の 2 サービスは MPS / MLX を使うため Docker 化していない（Docker Desktop for Mac は
+Mac-mini-M4Pro の 2 サービスは MPS / MLX を使うため Docker 化していない（Docker Desktop for Mac は
 Metal が見えないコンテナ内 VM で動くため）。launchd で常駐させる。
 
 閲覧は Obsidian で `repo/` を vault として開く。Web UI は DB を引かないとできない検索と
@@ -24,7 +24,7 @@ Metal が見えないコンテナ内 VM で動くため）。launchd で常駐�
 
 ```
 worker/    Pi で Docker 常駐させるワーカー・バッチ・スキーマ
-macmini/   Mac mini で launchd 常駐させる embed/transcribe サーバーと plist
+macmini/   Mac-mini-M4Pro で launchd 常駐させる embed/transcribe サーバーと plist
 ```
 
 ## セットアップ
@@ -32,7 +32,7 @@ macmini/   Mac mini で launchd 常駐させる embed/transcribe サーバーと
 ### Pi 側
 
 ```bash
-cp .env.example .env   # トークン・chat_id・Mac mini の IP を埋める
+cp .env.example .env   # トークン・chat_id・Mac-mini-M4Pro の IP を埋める
 mkdir -p data repo logs
 
 docker compose build
@@ -41,7 +41,7 @@ docker compose up -d
 docker compose logs -f ingest
 ```
 
-### Mac mini 側
+### Mac-mini-M4Pro 側
 
 ```bash
 uv pip install "transformers>=4.48.0" sentence-transformers sentencepiece torch \
@@ -65,7 +65,7 @@ docker compose run --rm ingest python -c \
 
 ### テスト
 
-Phase 1 / Phase 2 の通し試験。Mac mini の 2 サービス、GPU ノードの LLM、Telegram の
+Phase 1 / Phase 2 の通し試験。Mac-mini-M4Pro の 2 サービス、GPU ノードの LLM、Telegram の
 file API は `tests/fake_services.py` が同じ HTTP 契約で代役を務めるので、
 実機もモデルも要らない。
 
