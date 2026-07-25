@@ -166,7 +166,7 @@ class Handler(BaseHTTPRequestHandler):
             content = (
                 self.llm_script.pop(0) if self.llm_script else default_llm_reply(prompt)
             )
-            self.seen.append({"endpoint": "llm", "prompt": prompt,
+            self.seen.append({"endpoint": "llm", "path": self.path, "prompt": prompt,
                               "model": req.get("model")})
             self._json(200, {
                 "model": req.get("model", "fake-llm"),

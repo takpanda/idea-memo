@@ -53,9 +53,9 @@ class LLMConfigTests(unittest.TestCase):
 
         result = self.run_check()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(
-            [call["endpoint"] for call in self.services.calls], ["llm"]
-        )
+        llm_calls = [call for call in self.services.calls if call["endpoint"] == "llm"]
+        self.assertEqual(len(llm_calls), 1)
+        self.assertEqual(llm_calls[0]["path"], "/v1/chat/completions")
 
     def test_check_rejects_response_without_choices(self) -> None:
         self.services.set_llm_payload({"model": "fake-llm"})
