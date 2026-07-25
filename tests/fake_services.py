@@ -1,10 +1,11 @@
 """
-Phase 1 のテスト用スタブ。
+テスト用スタブ。
 
-Mac mini の埋め込み / 文字起こしサーバーと Telegram の file API を、
-本物と同じ HTTP 契約で喋る 1 プロセスに寄せる。ワーカー側の
-JSON 組み立て・multipart 生成・次元チェックまで通したいので、
-関数を差し替えるのではなくサーバーを立てる。
+Mac mini の埋め込み / 文字起こしサーバー、GPU ノードの LLM (OpenAI 互換)、
+Telegram の file API を、本物と同じ HTTP 契約で喋る 1 プロセスに寄せる。
+ワーカー側の JSON 組み立て・multipart 生成・次元チェック・
+コードフェンス剥がしまで通したいので、関数を差し替えるのではなく
+サーバーを立てる。
 
 埋め込みは文字 3-gram をハッシュして 768 次元に畳んだだけの偽物。
 「近い文は近いベクトルになる」ことだけが要件で、意味は持たない。
@@ -13,10 +14,26 @@ JSON 組み立て・multipart 生成・次元チェックまで通したいの�
 import hashlib
 import json
 import math
+import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 DIM = 768
+
+# ワーカーはモジュール定数として環境変数を読む。同じプロセスで Phase 1 と
+# Phase 2 を discover すると、先に import した側の DB とリポジトリを
+# 掴んだままになるので、テストモジュールごとに import し直させる
+WORKER_MODULES = (
+    "common", "init_db", "telegram_ingest", "transcribe_worker", "embed_worker",
+    "notify_worker", "theme_writer", "cluster_worker", "research_worker",
+    "digest_worker", "supervisor", "web",
+)
+
+
+def fresh_worker_imports() -> None:
+    """環境変数を差し替えた後、次の import で読み直させる。"""
+    for name in WORKER_MODULES:
+        sys.modules.pop(name, None)
 
 # 本物と同じ 1+3 プレフィックス。prefix が違えば別ベクトルになることも再現する
 PREFIXES = {
@@ -60,9 +77,29 @@ def _parse_multipart(body: bytes, boundary: str) -> dict[str, bytes]:
     return parts
 
 
+def default_llm_reply(prompt: str) -> str:
+    """メモ件数だけを見てテーマ名と要約を作る偽 LLM。
+
+    件数を名前に混ぜてあるので、メンバーが変わると「LLM が返す名前」も
+    変わる。テーマ名が初回のまま据え置かれること (ちらつき防止) と、
+    要約だけ作り直されることを、この差で見分けられる。
+    """
+    memos = [line for line in prompt.splitlines() if line.startswith("- (")]
+    first = memos[0].split(") ", 1)[-1] if memos else ""
+    return json.dumps(
+        {
+            "name": f"テーマ{len(memos)}件",
+            "summary": f"{len(memos)}件のメモ。代表: {first[:20]}",
+        },
+        ensure_ascii=False,
+    )
+
+
 class Handler(BaseHTTPRequestHandler):
     files: dict[str, bytes] = {}
     seen: list[dict] = []
+    # 先頭から取り出して返す生の content。空なら default_llm_reply
+    llm_script: list[str] = []
 
     def log_message(self, *args) -> None:      # テスト出力を汚さない
         pass
@@ -119,6 +156,20 @@ class Handler(BaseHTTPRequestHandler):
             })
             return
 
+        if self.path.endswith("/chat/completions"):
+            req = json.loads(body)
+            prompt = req["messages"][-1]["content"]
+            content = (
+                self.llm_script.pop(0) if self.llm_script else default_llm_reply(prompt)
+            )
+            self.seen.append({"endpoint": "llm", "prompt": prompt,
+                              "model": req.get("model")})
+            self._json(200, {
+                "model": req.get("model", "fake-llm"),
+                "choices": [{"message": {"role": "assistant", "content": content}}],
+            })
+            return
+
         self.send_error(404)
 
 
@@ -129,6 +180,7 @@ class FakeServices:
         self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
         Handler.files = {}
         Handler.seen = []
+        Handler.llm_script = []
 
     def __enter__(self) -> "FakeServices":
         self.thread.start()
@@ -143,6 +195,10 @@ class FakeServices:
 
     def blob(self, name: str) -> bytes:
         return Handler.files[name]
+
+    def script_llm(self, *replies: str) -> None:
+        """次の LLM 応答を指定する。壊れた応答を投げ込むのに使う。"""
+        Handler.llm_script = list(replies)
 
     @property
     def calls(self) -> list[dict]:

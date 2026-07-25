@@ -65,19 +65,23 @@ docker compose run --rm ingest python -c \
 
 ### テスト
 
-Phase 1 の通し試験。Mac mini の 2 サービスと Telegram の file API は
-`tests/fake_services.py` が同じ HTTP 契約で代役を務めるので、実機もモデルも要らない。
+Phase 1 / Phase 2 の通し試験。Mac mini の 2 サービス、GPU ノードの LLM、Telegram の
+file API は `tests/fake_services.py` が同じ HTTP 契約で代役を務めるので、
+実機もモデルも要らない。
 
 ```bash
-pip install sqlite-vec
+pip install sqlite-vec numpy scikit-learn
 python -m unittest discover -s tests
 ```
 
 ## Phase
 
 1. **Phase 1** — Telegram 取り込み・音声文字起こし・埋め込み・類似メモ通知（完了）
-2. **Phase 2** — HDBSCAN によるクラスタリング（ID 継承あり）・LLM によるテーマ命名
+2. **Phase 2** — HDBSCAN によるクラスタリング（ID 継承あり）・LLM によるテーマ命名（完了）
 3. **Phase 3** — テーマ単位の調査エージェント（先行事例・裏付け・反証を撃ち分け）・週次ダイジェスト
+
+テーマは **話題が 2 つ以上に分かれてから** 出る。HDBSCAN は木の根をクラスタとして
+選ばないため、似たメモばかりが数十件溜まっていても 1 話題のうちは全部「未分類」になる。
 
 ## 主な設計判断
 
@@ -86,6 +90,11 @@ python -m unittest discover -s tests
   自前の FastAPI サーバーで持つ（プレフィックス方式を正確に制御するため）
 - 類似メモの提示・参考情報の要否は「提案」に留め、人間の承認/却下だけを `relations` /
   `findings.verdict` に永続化する
+- テーマ名は初回だけ LLM に付けさせ、要約だけ作り直す。テーマノートの front matter で
+  `name_locked: true` にすれば、その名前が LLM より強い
+- HDBSCAN のラベルは毎回振り直されるので、メンバー集合の Jaccard 係数で前回の
+  クラスタ ID を引き継ぐ。消えたクラスタは閉じるだけで消さず、同じ話題が戻れば
+  同じテーマに戻る
 - status の自動 archive はしない。手動判断のみ
 - reconciliation（文字起こし・埋め込み・通知・命名）はキューを持たず、欠損を検出して
   埋める設計。ワーカーが落ちても次の周回で追いつく

@@ -91,7 +91,7 @@ def fetch_pending(db, limit: int = 5):
     """名前が無い、または命名時からメンバーが変わったクラスタ。"""
     return db.execute(
         """
-        SELECT id, uid, name, name_locked, member_hash, named_member_hash
+        SELECT id, uid, name, name_locked, file_path, member_hash, named_member_hash
         FROM   clusters
         WHERE  closed_at IS NULL
                AND (name IS NULL OR named_member_hash IS NOT member_hash)
@@ -122,31 +122,68 @@ def collect_memos(db, cluster_id: int) -> list[str]:
     return memos
 
 
-def process(db, cluster) -> None:
-    cluster_id = cluster["id"]
-    file_path = f"themes/{cluster['uid']}.md"
+def absorb_overrides(db) -> int:
+    """テーマノートの front matter に入った人の判断を DB に吸い上げる。
 
-    # 人が Markdown を直していたら、そちらを先に DB へ吸い上げる
-    overrides = read_theme_overrides(REPO_ROOT / file_path)
-    name_locked = overrides.get("name_locked", cluster["name_locked"])
-    if overrides.get("name_locked") and overrides.get("name"):
+    メンバーが動くまで待つと、Obsidian に出る名前と Web UI・ダイジェストに
+    出る名前が食い違ったままになるので、命名待ちかどうかに関係なく毎周回で見る。
+    開いているテーマの数だけの小さなファイル読みなので素直に全部読む。
+    """
+    changed = 0
+    rows = db.execute(
+        """
+        SELECT id, name, name_locked, file_path
+        FROM   clusters
+        WHERE  closed_at IS NULL AND file_path IS NOT NULL
+        """
+    ).fetchall()
+
+    for row in rows:
+        overrides = read_theme_overrides(REPO_ROOT / row["file_path"])
+        if "name_locked" not in overrides:
+            continue
+
+        locked = overrides["name_locked"]
+        # 名前を人から取るのはロックされているときだけ。
+        # ロックが無ければテーマノートは DB の出力でしかない
+        name = (overrides.get("name") or row["name"]) if locked else row["name"]
+        if (locked, name) == (row["name_locked"], row["name"]):
+            continue
+
         with db:
             db.execute(
-                "UPDATE clusters SET name = ?, name_locked = 1 WHERE id = ?",
-                (overrides["name"], cluster_id),
+                """
+                UPDATE clusters
+                SET    name = ?, name_locked = ?,
+                       updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+                WHERE  id = ?
+                """,
+                (name, locked, row["id"]),
             )
+        write_theme_markdown(db, row["id"])
+        changed += 1
+        log.info("absorbed override: %s (locked=%d)", name, locked)
+
+    return changed
+
+
+def process(db, cluster) -> bool:
+    cluster_id = cluster["id"]
+    file_path = cluster["file_path"] or f"themes/{cluster['uid']}.md"
 
     memos = collect_memos(db, cluster_id)
     if not memos:
-        return
+        return False
 
     result = call_llm(memos)
     if result is None:
-        return
+        # 確定させずに戻る。次の周回で拾い直すので、進捗としては数えない
+        return False
 
-    # 名前は初回のみ。既にあるものは触らない (ちらつき防止)
-    keep_name = bool(cluster["name"]) or bool(name_locked)
-    new_name = cluster["name"] if keep_name else result["name"][:40]
+    # 名前は初回のみ。既にあるもの・人が固定したものは触らない (ちらつき防止)
+    keep_name = bool(cluster["name"]) or bool(cluster["name_locked"])
+    # 改行入りの名前を返してくることがある。見出しにも front matter にも載るので均す
+    new_name = cluster["name"] if keep_name else " ".join(result["name"].split())[:40]
 
     with db:
         db.execute(
@@ -162,13 +199,17 @@ def process(db, cluster) -> None:
 
     write_theme_markdown(db, cluster_id)
     log.info("theme %s -> %s (%d memos)", cluster["uid"], new_name, len(memos))
+    return True
 
 
 def tick(db) -> int:
-    clusters = fetch_pending(db)
-    for cluster in clusters:
-        process(db, cluster)
-    return len(clusters)
+    """進んだ件数を返す。拾えなかったクラスタを数に入れると
+    supervisor が「まだ仕事がある」と見て毎周回で空回りする。"""
+    done = absorb_overrides(db)
+    for cluster in fetch_pending(db):
+        if process(db, cluster):
+            done += 1
+    return done
 
 
 def main() -> None:
