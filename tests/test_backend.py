@@ -27,8 +27,8 @@ class FakeResponse:
     def __exit__(self, *args):
         return False
 
-    def read(self):
-        return self.payload
+    def read(self, size=-1):
+        return self.payload if size < 0 else self.payload[:size]
 
 
 class ThemeWriterResponseTest(unittest.TestCase):
@@ -52,6 +52,36 @@ class ThemeWriterResponseTest(unittest.TestCase):
         payload = {"choices": [{"message": {"content": None, "reasoning": None}}]}
         with patch.object(theme_writer.urllib.request, "urlopen", return_value=FakeResponse(payload)):
             self.assertIsNone(theme_writer.call_llm(["memo"]))
+
+
+class TelegramUrlContentTest(unittest.TestCase):
+    def test_extract_url_trims_sentence_punctuation(self):
+        import telegram_ingest
+
+        self.assertEqual(
+            telegram_ingest.extract_url("参考 https://example.com/page。"),
+            "https://example.com/page",
+        )
+
+    def test_fetch_url_content_extracts_title_and_visible_text(self):
+        import telegram_ingest
+
+        response = FakeResponse({})
+        response.payload = (
+            "<html><head><title>Example &amp; title</title></head>"
+            "<body><h1>見出し</h1><p>本文です。</p><script>secret()</script>"
+            "</body></html>"
+        ).encode("utf-8")
+        response.headers = SimpleNamespace(
+            get_content_charset=lambda: "utf-8"
+        )
+        with patch.object(telegram_ingest.urllib.request, "urlopen", return_value=response):
+            content = telegram_ingest.fetch_url_content("https://example.com/page")
+
+        self.assertIn("URL: https://example.com/page", content)
+        self.assertIn("タイトル: Example & title", content)
+        self.assertIn("見出し 本文です。", content)
+        self.assertNotIn("secret", content)
 
 
 class ExistingDatabaseMigrationTest(unittest.TestCase):
