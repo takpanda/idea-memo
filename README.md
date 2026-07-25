@@ -107,9 +107,18 @@ Ollama をLANから受け付けるには、Mac-mini-M4Pro上で `OLLAMA_HOST=0.0
 を設定してOllamaを再起動し、macOSファイアウォールでTCP 11434を許可する。
 実際の常駐設定は利用中のOllamaインストール方法に合わせること。
 
-テーマ生成の一次確認は `docker compose run --rm ingest python theme_writer.py` で行い、
-`themes/` に更新されたノートが1件以上生成されることを確認する。調査ワーカーは
-`docker compose run --rm ingest python research_worker.py` で確認する。
+テーマ生成の一次確認は、未命名またはメンバー変更済みのクラスタを用意したうえで、
+次の1パス実行を使う。`supervisor.py --once` は常駐せず、処理後に終了する。
+
+```bash
+started=$(date +%s)
+docker compose run --rm supervisor python supervisor.py --once
+test "$(find repo/themes -type f -newermt "@$started" | wc -l)" -ge 1
+```
+
+終了条件は、コマンドの終了コードが0で、`repo/themes/` に実行開始後に更新された
+Markdownが1件以上あること。調査ワーカーは `docker compose run --rm ingest python
+research_worker.py` が終了コード0で完了することを確認する。
 
 DGX Sparkへ戻す場合は `.env` を `LLM_BASE_URL=http://gpu-node:8000/v1` と
 `LLM_MODEL=deepseek-v4-flash` に戻し、`docker compose up -d --force-recreate supervisor scheduler`
