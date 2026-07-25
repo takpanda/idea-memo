@@ -31,22 +31,22 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("theme-writer")
 
 SYSTEM = (
-    "あなたは個人のアイデアメモを整理する編集者です。"
-    "与えられたメモ群に共通する主題を読み取り、JSON だけを返してください。"
-    "前置き、説明、コードフェンスは一切不要です。"
+    "You are an editor organizing personal idea notes. "
+    "Output ONLY valid JSON. No thinking, no explanation, nothing else."
 )
 
-PROMPT = """以下は同じクラスタに分類されたメモです。
+PROMPT = """Below are notes grouped into the same cluster.
 
 {memos}
 
-次の形式の JSON を返してください。
+Return JSON in this exact format:
+{{"name": "theme name under 20 chars in Japanese", "summary": "2-3 sentences summary in Japanese"}}
 
-{{"name": "20文字以内のテーマ名", "summary": "3文以内。何についての集まりで、どんな論点が含まれるか"}}
-
-制約:
-- name は具体的に。「アイデア」「メモ」「その他」のような中身のない名前にしない
-- メモに書かれていないことを推測で足さない
+Rules:
+- Output ONLY the JSON object, nothing else.
+- No thinking, no analysis, no code fences.
+- Name must be concrete and specific. NOT "アイデア", "メモ", "その他".
+- Do NOT add information not present in the notes.
 """
 
 
@@ -68,7 +68,7 @@ def call_llm(memos: list[str]) -> dict | None:
         data=body,
         headers={"Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(req, timeout=180) as res:
+    with urllib.request.urlopen(req, timeout=300) as res:
         payload = json.loads(res.read())
 
     msg = payload["choices"][0]["message"]; text = (msg.get("content") or msg.get("reasoning") or "").strip()
