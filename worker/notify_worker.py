@@ -94,6 +94,10 @@ def find_similar(db, idea_id: int) -> list[dict]:
     if own is None:
         return []
 
+    self_meta = db.execute(
+        "SELECT captured_at FROM ideas WHERE id = ?", (idea_id,)
+    ).fetchone()
+
     # KNN は単独クエリで回す (vec0 の MATCH は JOIN と併用しにくい)
     knn = db.execute(
         f"SELECT idea_id, distance FROM {VEC_TABLE} WHERE embedding MATCH ? AND k = ?",
@@ -109,10 +113,19 @@ def find_similar(db, idea_id: int) -> list[dict]:
         score = 1.0 - row["distance"]
         if score < SIM_THRESHOLD:
             continue
+        # 提示するのは常に過去のメモ。両方から出すと同じ 1 組で 2 通届く
+        # (溜まった分をまとめて処理する初回や、Mac mini 復帰後に必ず起きる)。
+        # 引き換えに、古い captured_at のメモを後から取り込んだ場合だけ
+        # その組が提示されなくなる
         meta = db.execute(
-            "SELECT id, uid, body, captured_at FROM ideas "
-            "WHERE id = ? AND status != 'archived'",
-            (row["idea_id"],),
+            """
+            SELECT id, uid, body, captured_at FROM ideas
+            WHERE  id = :other AND status != 'archived'
+                   AND (captured_at < :captured
+                        OR (captured_at = :captured AND id < :self))
+            """,
+            {"other": row["idea_id"], "captured": self_meta["captured_at"],
+             "self": idea_id},
         ).fetchone()
         if meta is None or not meta["body"]:
             continue
