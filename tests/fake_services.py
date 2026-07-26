@@ -100,6 +100,7 @@ class Handler(BaseHTTPRequestHandler):
     seen: list[dict] = []
     # 先頭から取り出して返す生の content。空なら default_llm_reply
     llm_script: list[str] = []
+    llm_payload: dict | None = None
 
     def log_message(self, *args) -> None:      # テスト出力を汚さない
         pass
@@ -158,11 +159,14 @@ class Handler(BaseHTTPRequestHandler):
 
         if self.path.endswith("/chat/completions"):
             req = json.loads(body)
+            if self.llm_payload is not None:
+                self._json(200, self.llm_payload)
+                return
             prompt = req["messages"][-1]["content"]
             content = (
                 self.llm_script.pop(0) if self.llm_script else default_llm_reply(prompt)
             )
-            self.seen.append({"endpoint": "llm", "prompt": prompt,
+            self.seen.append({"endpoint": "llm", "path": self.path, "prompt": prompt,
                               "model": req.get("model")})
             self._json(200, {
                 "model": req.get("model", "fake-llm"),
@@ -181,6 +185,7 @@ class FakeServices:
         Handler.files = {}
         Handler.seen = []
         Handler.llm_script = []
+        Handler.llm_payload = None
 
     def __enter__(self) -> "FakeServices":
         self.thread.start()
@@ -199,6 +204,10 @@ class FakeServices:
     def script_llm(self, *replies: str) -> None:
         """次の LLM 応答を指定する。壊れた応答を投げ込むのに使う。"""
         Handler.llm_script = list(replies)
+
+    def set_llm_payload(self, payload: dict | None) -> None:
+        """LLM のHTTP 200応答を差し替える。異常レスポンスのテスト用。"""
+        Handler.llm_payload = payload
 
     @property
     def calls(self) -> list[dict]:

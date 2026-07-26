@@ -18,10 +18,11 @@ import os
 import time
 import urllib.error
 import urllib.request
+from urllib.parse import urlsplit
 
 from common import REPO_ROOT, connect, read_theme_overrides, write_theme_markdown
 
-LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "http://gpu-node:8000/v1")
+LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "http://gpu-node:8000/v1").rstrip("/")
 LLM_MODEL = os.environ.get("LLM_MODEL", "deepseek-v4-flash")
 MAX_MEMOS_IN_PROMPT = 25
 SNIPPET_LEN = 200
@@ -31,47 +32,111 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("theme-writer")
 
 SYSTEM = (
-    "あなたは個人のアイデアメモを整理する編集者です。"
-    "与えられたメモ群に共通する主題を読み取り、JSON だけを返してください。"
-    "前置き、説明、コードフェンスは一切不要です。"
+    "You are an editor organizing personal idea notes. "
+    "Output ONLY valid JSON. No thinking, no explanation, nothing else."
 )
 
-PROMPT = """以下は同じクラスタに分類されたメモです。
+PROMPT = """Below are notes grouped into the same cluster.
 
 {memos}
 
-次の形式の JSON を返してください。
+Return JSON in this exact format:
+{{"name": "theme name under 20 chars in Japanese", "summary": "2-3 sentences summary in Japanese"}}
 
-{{"name": "20文字以内のテーマ名", "summary": "3文以内。何についての集まりで、どんな論点が含まれるか"}}
-
-制約:
-- name は具体的に。「アイデア」「メモ」「その他」のような中身のない名前にしない
-- メモに書かれていないことを推測で足さない
+Rules:
+- Output ONLY the JSON object, nothing else.
+- No thinking, no analysis, no code fences.
+- Name must be concrete and specific. NOT "アイデア", "メモ", "その他".
+- Do NOT add information not present in the notes.
 """
 
 
+def _ollama_endpoint(base_url: str) -> str | None:
+    """11434 を指すベースURLをOllamaネイティブAPIのURLに変換する。"""
+    try:
+        parsed = urlsplit(base_url)
+        if parsed.port != 11434 or not parsed.scheme or not parsed.netloc:
+            return None
+    except ValueError:
+        return None
+    return f"{parsed.scheme}://{parsed.netloc}/api/chat"
+
+
+def _parse_ollama_text(raw: bytes) -> str:
+    """単一JSONまたはストリーミングNDJSONから応答本文を取り出す。"""
+    try:
+        payload = json.loads(raw)
+        payloads = [payload]
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        payloads = []
+        for line in raw.decode("utf-8", errors="replace").splitlines():
+            try:
+                payloads.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+
+    contents = []
+    for payload in payloads:
+        message = payload.get("message") if isinstance(payload, dict) else None
+        if not isinstance(message, dict):
+            continue
+        # Ollama の thinking モデルは content="" + thinking に本文が入る
+        content = message.get("content") or message.get("thinking") or ""
+        if content.strip():
+            contents.append(content)
+    return "".join(contents).strip()
+
+
 def call_llm(memos: list[str]) -> dict | None:
-    body = json.dumps(
-        {
-            "model": LLM_MODEL,
-            "messages": [
-                {"role": "system", "content": SYSTEM},
-                {"role": "user", "content": PROMPT.format(memos="\n".join(memos))},
-            ],
-            "temperature": 0.2,
-            "max_tokens": 400,
-        }
-    ).encode("utf-8")
+    ollama_url = _ollama_endpoint(LLM_BASE_URL)
+    is_ollama = ollama_url is not None
+    request_body = {
+        "model": LLM_MODEL,
+        "messages": [
+            {"role": "system", "content": SYSTEM},
+            {"role": "user", "content": PROMPT.format(memos="\n".join(memos))},
+        ],
+    }
+    if is_ollama:
+        # OllamaのネイティブAPIでは構造化JSONとテンプレート無効化を
+        # トップレベルで指定する（/api/generateと同じAPI契約）。
+        request_body.update({
+            "format": "json",
+            "raw": True,
+            "options": {"temperature": 0.2, "num_predict": 2000},
+        })
+    else:
+        request_body.update({"temperature": 0.2, "max_tokens": 2000})
+
+    body = json.dumps(request_body).encode("utf-8")
 
     req = urllib.request.Request(
-        f"{LLM_BASE_URL}/chat/completions",
+        ollama_url if is_ollama else f"{LLM_BASE_URL}/chat/completions",
         data=body,
         headers={"Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(req, timeout=180) as res:
-        payload = json.loads(res.read())
+    with urllib.request.urlopen(req, timeout=300) as res:
+        raw = res.read()
 
-    text = payload["choices"][0]["message"]["content"].strip()
+    if is_ollama:
+        text = _parse_ollama_text(raw)
+    else:
+        try:
+            payload = json.loads(raw)
+            msg = payload["choices"][0]["message"]
+        except (UnicodeDecodeError, json.JSONDecodeError, KeyError, IndexError, TypeError):
+            return None
+
+        # DeepSeek の thinking 応答では content が null になり、reasoning に
+        # 本文が入ることがある。空文字も「本文なし」として reasoning を試す。
+        content = msg.get("content")
+        reasoning = msg.get("reasoning")
+        if isinstance(content, str) and content.strip():
+            text = content.strip()
+        elif isinstance(reasoning, str) and reasoning.strip():
+            text = reasoning.strip()
+        else:
+            text = ""
     # JSON だけを返せと言っても囲ってくる場合があるので保険
     if text.startswith("```"):
         text = text.strip("`")
@@ -82,7 +147,7 @@ def call_llm(memos: list[str]) -> dict | None:
         log.warning("LLM returned non-JSON: %s", text[:200])
         return None
 
-    if not isinstance(result.get("name"), str):
+    if not isinstance(result, dict) or not isinstance(result.get("name"), str):
         return None
     return result
 

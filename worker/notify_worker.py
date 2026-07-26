@@ -18,7 +18,7 @@ import os
 import time
 import urllib.error
 
-from common import CHAT_ID, api, connect
+from common import CHAT_ID, STANCE_MARK, api, connect
 
 MODEL = "cl-nagoya/ruri-v3-310m"
 VEC_TABLE = "vec_ideas_ruri_v3_310m"
@@ -34,7 +34,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("notify-worker")
 
 MARKS = ["①", "②", "③"]
-STANCE_MARK = {"supports": "◯", "challenges": "▲", "neutral": "・"}
 
 
 def snippet(body: str, length: int = SNIPPET_LEN) -> str:

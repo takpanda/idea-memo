@@ -492,6 +492,8 @@ INDEX = """<!doctype html>
   mark { background:var(--mark); color:inherit; border-radius:3px; }
   .stance-challenges { color:#e0642f; }
   .stance-supports { color:#2e9e5b; }
+  /* 不要と判断した参考情報。テーマノートからは消えるが、俯瞰では残す */
+  .dropped { opacity:.45; }
   a { color:var(--accent); }
   .empty { color:var(--dim); padding:2rem 0; }
   .back { display:inline-block; font-size:.85rem; color:var(--dim); text-decoration:none;

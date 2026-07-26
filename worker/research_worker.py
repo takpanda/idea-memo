@@ -24,9 +24,9 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from common import connect
+from common import connect, write_theme_markdown
 
-LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "http://gpu-node:8000/v1")
+LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "http://gpu-node:8000/v1").rstrip("/")
 LLM_MODEL = os.environ.get("LLM_MODEL", "deepseek-v4-flash")
 
 SEARCH_BACKEND = os.environ.get("SEARCH_BACKEND", "brave")   # 'brave' | 'searxng'
@@ -218,7 +218,12 @@ def fetch_text(url: str) -> str:
 # 本体
 # ------------------------------------------------------------
 def fetch_pending(db, limit: int = 3):
-    """未調査、または前回調査後にメンバーが増えて 1 週間経ったテーマ。"""
+    """未調査、または前回調査後にメンバーが増えて 1 週間経ったテーマ。
+
+    researched_at は 'YYYY-MM-DDTHH:MM:SSZ' で書いているので、比較相手も
+    同じ書式で作る。datetime('now') はスペース区切りを返すので、素朴に
+    比べると 'T' (0x54) > ' ' (0x20) で同日が必ず「新しい」判定になる。
+    """
     return db.execute(
         """
         SELECT id, uid, name, summary, member_hash
@@ -228,7 +233,7 @@ def fetch_pending(db, limit: int = 3):
                AND size >= ?
                AND (researched_at IS NULL
                     OR (member_hash IS NOT researched_member_hash
-                        AND researched_at < datetime('now', ?)))
+                        AND researched_at < strftime('%Y-%m-%dT%H:%M:%SZ','now',?)))
         ORDER BY researched_at IS NOT NULL, size DESC
         LIMIT ?
         """,
@@ -251,6 +256,33 @@ def known_urls(db, cluster_id: int) -> set[str]:
     return {
         r["url"]
         for r in db.execute("SELECT url FROM findings WHERE cluster_id = ?", (cluster_id,))
+    }
+
+
+STANCES = ("supports", "challenges", "neutral")
+
+
+def pick_item(candidates: list[dict], pick) -> dict | None:
+    """LLM が返した 1 件を候補に解決する。
+
+    index は「文字列で返す」「範囲外」「負数」のどれもあり得る。
+    stance も表記ゆれがあるので、CHECK 制約に通る値以外は捨てる。
+    NULL は「スタンス不明」として許されているので落とす必要はない。
+    """
+    if not isinstance(pick, dict):
+        return None
+    try:
+        index = int(pick["index"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not 0 <= index < len(candidates):
+        return None
+
+    stance = pick.get("stance")
+    return {
+        **candidates[index],
+        "stance": stance if stance in STANCES else None,
+        "reason": str(pick.get("reason") or ""),
     }
 
 
@@ -293,10 +325,10 @@ def research(db, cluster) -> None:
         )
         picks = (selection or {}).get("picks", []) if isinstance(selection, dict) else []
 
+        stored = 0
         for pick in picks[:MAX_FINDINGS_PER_RUN]:
-            try:
-                item = candidates[int(pick["index"])]
-            except (KeyError, ValueError, IndexError):
+            item = pick_item(candidates, pick)
+            if item is None:
                 continue
 
             body = fetch_text(item["url"]) or item["snippet"]
@@ -310,7 +342,7 @@ def research(db, cluster) -> None:
             summary = (written or {}).get("summary") if isinstance(written, dict) else None
 
             with db:
-                db.execute(
+                cur = db.execute(
                     """
                     INSERT INTO findings(cluster_id, query_kind, query, url, title,
                                          site, summary, stance)
@@ -324,11 +356,16 @@ def research(db, cluster) -> None:
                         item["url"],
                         item["title"],
                         item["site"],
-                        summary or pick.get("reason", ""),
-                        pick.get("stance"),
+                        summary or item["reason"],
+                        item["stance"],
                     ),
                 )
-            log.info("finding: %s (%s)", item["title"][:50], pick.get("stance"))
+            stored += cur.rowcount
+            log.info("finding: %s (%s)", (item["title"] or item["url"])[:50], item["stance"])
+
+        # テーマノートは Obsidian で読む正面なので、集めたら書き戻す
+        if stored:
+            write_theme_markdown(db, cluster["id"])
 
     with db:
         db.execute(

@@ -12,11 +12,11 @@
 
 ```
 Pi (Docker)   ingest / supervisor / web / scheduler
-Mac mini      embed_server:7997 (ruri-v3-310m) / transcribe_server:7998 (Whisper)
+Mac-mini-M4Pro    embed_server:7997 (ruri-v3-310m) / transcribe_server:7998 (Whisper)
 GPU ノード     vLLM (テーマ命名・要約・調査クエリ生成、Docker 対象外)
 ```
 
-Mac mini の 2 サービスは MPS / MLX を使うため Docker 化していない（Docker Desktop for Mac は
+Mac-mini-M4Pro の 2 サービスは MPS / MLX を使うため Docker 化していない（Docker Desktop for Mac は
 Metal が見えないコンテナ内 VM で動くため）。launchd で常駐させる。
 
 腰を据えて読み書きするときは Obsidian で `repo/` を vault として開く。外出先の iPhone や
@@ -24,7 +24,16 @@ Metal が見えないコンテナ内 VM で動くため）。launchd で常駐�
 
 ```
 worker/    Pi で Docker 常駐させるワーカー・バッチ・スキーマ
-macmini/   Mac mini で launchd 常駐させる embed/transcribe サーバーと plist
+macmini/   Mac-mini-M4Pro で launchd 常駐させる embed/transcribe サーバーと plist
+tests/     外部 (Telegram / LLM / 検索 / 埋め込み) だけを差し替えた通し試験
+```
+
+vault 側 (`repo/`) の中身:
+
+```
+ideas/YYYY/MM/  メモ 1 件 1 ファイル
+themes/         クラスタごとのテーマノート。集めた参考情報もここに載る
+digests/        週次ダイジェスト (YYYY-Www.md)
 ```
 
 ### Web UI
@@ -48,7 +57,7 @@ Pi 側には要らない）。ポートをそのままインターネットに�
 ### Pi 側
 
 ```bash
-cp .env.example .env   # トークン・chat_id・Mac mini の IP を埋める
+cp .env.example .env   # トークン・chat_id・Mac-mini-M4Pro の IP を埋める
 mkdir -p data repo logs
 
 docker compose build
@@ -57,7 +66,7 @@ docker compose up -d
 docker compose logs -f ingest
 ```
 
-### Mac mini 側
+### Mac-mini-M4Pro 側
 
 ```bash
 uv pip install "transformers>=4.48.0" sentence-transformers sentencepiece torch \
@@ -71,6 +80,66 @@ launchctl load -w ~/Library/LaunchAgents/local.idea-memo.transcribe.plist
 sudo pmset -a sleep 0 disksleep 0   # スリープで文字起こしが止まらないように
 ```
 
+### 検索バックエンド (Phase 3)
+
+調査エージェントは Brave Search API か、自前の SearXNG を使う。
+`.env` の `SEARCH_BACKEND` で切り替える。
+
+```bash
+# Brave (既定)。無料枠でも週 1 回のバッチなら足りる
+SEARCH_BACKEND=brave BRAVE_API_KEY=...
+
+# 自前で持つ場合
+docker compose --profile searxng up -d
+# SEARCH_BACKEND=searxng SEARXNG_URL=http://searxng:8080
+```
+
+バッチは `worker/crontab` で回している (クラスタ再構成 毎日 4:00 /
+調査 日曜 3:00 / ダイジェスト 日曜 8:00)。手で回すなら:
+
+```bash
+docker compose run --rm ingest python research_worker.py
+```
+
+### LLM の切り替え (Ollama / vLLM)
+
+テーマ生成と調査ワーカーは、`.env` の `LLM_BASE_URL` と `LLM_MODEL` を共通で参照する。
+Mac-mini-M4Pro (192.168.1.102) の Ollama を使う例:
+
+```bash
+# Mac-mini-M4Pro 上で Ollama をインストール・常駐させる
+ollama serve
+ollama pull qwen2.5:7b
+
+# Pi 側の .env
+LLM_BASE_URL=http://192.168.1.102:11434/v1
+LLM_MODEL=qwen2.5:7b
+
+# Pi から OpenAI 互換 API を確認（本文は出力しない）
+docker compose run --rm ingest python check_llm.py
+```
+
+Ollama をLANから受け付けるには、Mac-mini-M4Pro上で `OLLAMA_HOST=0.0.0.0:11434`
+を設定してOllamaを再起動し、macOSファイアウォールでTCP 11434を許可する。
+実際の常駐設定は利用中のOllamaインストール方法に合わせること。
+
+テーマ生成の一次確認は、未命名またはメンバー変更済みのクラスタを用意したうえで、
+次の1パス実行を使う。`supervisor.py --once` は常駐せず、処理後に終了する。
+
+```bash
+started=$(date +%s)
+docker compose run --rm supervisor python supervisor.py --once
+test "$(find repo/themes -type f -newermt "@$started" | wc -l)" -ge 1
+```
+
+終了条件は、コマンドの終了コードが0で、`repo/themes/` に実行開始後に更新された
+Markdownが1件以上あること。調査ワーカーは `docker compose run --rm ingest python
+research_worker.py` が終了コード0で完了することを確認する。
+
+DGX Sparkへ戻す場合は `.env` を `LLM_BASE_URL=http://gpu-node:8000/v1` と
+`LLM_MODEL=deepseek-v4-flash` に戻し、`docker compose up -d --force-recreate supervisor scheduler`
+（または対象ワーカーの再起動）を実行する。Ollama側のモデル削除・停止は不要。
+
 ### 動作確認
 
 ```bash
@@ -81,9 +150,9 @@ docker compose run --rm ingest python -c \
 
 ### テスト
 
-Phase 1 / Phase 2 / Web UI の通し試験。Mac mini の 2 サービス、GPU ノードの LLM、Telegram の
+Phase 1 / Phase 2 / Web UI の通し試験。Mac-mini-M4Pro の 2 サービス、GPU ノードの LLM、Telegram の
 file API は `tests/fake_services.py` が同じ HTTP 契約で代役を務めるので、
-実機もモデルも要らない。
+実機もモデルも要らない (検索バックエンドだけはモジュール関数を直接差し替える)。
 
 ```bash
 pip install sqlite-vec numpy scikit-learn fastapi httpx
@@ -94,7 +163,7 @@ python -m unittest discover -s tests
 
 1. **Phase 1** — Telegram 取り込み・音声文字起こし・埋め込み・類似メモ通知（完了）
 2. **Phase 2** — HDBSCAN によるクラスタリング（ID 継承あり）・LLM によるテーマ命名（完了）
-3. **Phase 3** — テーマ単位の調査エージェント（先行事例・裏付け・反証を撃ち分け）・週次ダイジェスト
+3. **Phase 3** — テーマ単位の調査エージェント（先行事例・裏付け・反証を撃ち分け）・週次ダイジェスト（完了）
 
 テーマは **話題が 2 つ以上に分かれてから** 出る。HDBSCAN は木の根をクラスタとして
 選ばないため、似たメモばかりが数十件溜まっていても 1 話題のうちは全部「未分類」になる。
