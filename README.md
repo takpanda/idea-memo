@@ -19,13 +19,29 @@ GPU ノード     vLLM (テーマ命名・要約・調査クエリ生成、Docke
 Mac mini の 2 サービスは MPS / MLX を使うため Docker 化していない（Docker Desktop for Mac は
 Metal が見えないコンテナ内 VM で動くため）。launchd で常駐させる。
 
-閲覧は Obsidian で `repo/` を vault として開く。Web UI は DB を引かないとできない検索と
-クラスタ俯瞰だけを持つ。
+腰を据えて読み書きするときは Obsidian で `repo/` を vault として開く。外出先の iPhone や
+手元にブラウザしかない端末からは Web UI（`http://<Pi>:8080`）で読む。
 
 ```
 worker/    Pi で Docker 常駐させるワーカー・バッチ・スキーマ
 macmini/   Mac mini で launchd 常駐させる embed/transcribe サーバーと plist
 ```
+
+### Web UI
+
+ビルドステップなしの HTML 1 枚。iPhone の画面幅とダークモードに合わせてある。
+
+- **メモ** — 新しい順の一覧。status（inbox / 残す / archive）とテーマで絞り込み、
+  下端の「もっと読む」で次の 30 件。タップで本文全文・返信の連なり・承認済みの関連メモ
+- **検索** — ベクトル + 全文のハイブリッド。ヒット箇所を強調し、抜粋はヒット位置に寄せる
+- **テーマ** — テーマ一覧 → 中身（要約・参考情報・メンバー）。未分類のメモもここから辿れる
+- status の変更はここからできる（自動 archive はしない方針なので、Telegram 以外の唯一の導線）
+
+画面は `#/ideas/<uid>` のような URL を持つので、iPhone の戻るジェスチャがそのまま効き、
+検索結果の URL をそのまま開き直せる。
+
+**認証は持たない。** LAN の外から使うなら Tailscale などの上に置く（そのぶんの追加インフラは
+Pi 側には要らない）。ポートをそのままインターネットに晒さないこと。
 
 ## セットアップ
 
@@ -65,12 +81,12 @@ docker compose run --rm ingest python -c \
 
 ### テスト
 
-Phase 1 / Phase 2 の通し試験。Mac mini の 2 サービス、GPU ノードの LLM、Telegram の
+Phase 1 / Phase 2 / Web UI の通し試験。Mac mini の 2 サービス、GPU ノードの LLM、Telegram の
 file API は `tests/fake_services.py` が同じ HTTP 契約で代役を務めるので、
 実機もモデルも要らない。
 
 ```bash
-pip install sqlite-vec numpy scikit-learn
+pip install sqlite-vec numpy scikit-learn fastapi httpx
 python -m unittest discover -s tests
 ```
 
@@ -96,6 +112,8 @@ python -m unittest discover -s tests
   クラスタ ID を引き継ぐ。消えたクラスタは閉じるだけで消さず、同じ話題が戻れば
   同じテーマに戻る
 - status の自動 archive はしない。手動判断のみ
+- Web UI からの書き込みは status の変更だけ。本文編集を入れると Markdown と DB の
+  双方向同期が要り、「正本は DB、Markdown は再生成」が崩れる
 - reconciliation（文字起こし・埋め込み・通知・命名）はキューを持たず、欠損を検出して
   埋める設計。ワーカーが落ちても次の周回で追いつく
 

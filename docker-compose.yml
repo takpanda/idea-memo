@@ -44,7 +44,8 @@ services:
     command: python supervisor.py
 
   # --- UI -----------------------------------------------------------
-  # 検索とクラスタ俯瞰だけ。メモとテーマの閲覧は Obsidian で repo/ を開く
+  # 外出先の iPhone やブラウザから読む側。腰を据えて読み書きするなら Obsidian で repo/ を開く。
+  # 認証を持たないので、LAN の外に出すときは Tailscale などの上に置くこと
   web:
     <<: *worker
     container_name: idea-web
