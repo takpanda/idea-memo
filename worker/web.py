@@ -1,12 +1,17 @@
 """
-検索・俯瞰 UI (Raspberry Pi、Docker)
+閲覧・検索 UI (Raspberry Pi、Docker)
 
-Obsidian で読めるものは作らない。DB を引かないとできないことだけを持つ:
-  - ハイブリッド検索 (ベクトル + FTS5 を RRF で統合)
-  - クラスタ一覧とテーマの中身
+母艦は Obsidian のままだが、外出先の iPhone からは vault を開けない。
+ブラウザさえあれば読める側を用意する:
+
+  - メモ一覧   status / テーマで絞り込み、captured_at のキーセットページング
+  - 全文検索   ベクトル + FTS5 を RRF で統合したハイブリッド検索
+  - テーマ     一覧とテーマの中身 (メンバー + 参考情報)
+  - メモ詳細   本文全文・関連メモ・返信の連なり
   - status の手動変更 (自動 archive はしない方針なので、ここが唯一の導線)
 
 ビルドステップを持ちたくないので、HTML は 1 枚をインラインで返す。
+画面遷移はハッシュルーティングにして、iPhone の戻るジェスチャで戻れるようにする。
 
   uvicorn web:app --host 0.0.0.0 --port 8080
 """
@@ -25,8 +30,31 @@ EMBED_URL = os.environ.get("EMBED_URL", "http://mac-mini.local:7997/embed")
 VEC_TABLE = "vec_ideas_ruri_v3_310m"
 RRF_K = 60          # Reciprocal Rank Fusion の定数。慣例値
 POOL = 30
+PAGE = 30
+MAX_PAGE = 100
+SNIPPET_LEN = 140
+STATUSES = ("inbox", "kept", "archived")
 
 app = FastAPI(title="idea-memo")
+
+
+def snippet(body: str, query: str = "") -> str:
+    """一覧・検索結果に載せる抜粋。
+
+    長いメモでヒットが末尾にあると、頭から切っただけでは何に当たったのか
+    分からない。キーワードがあればその周りに窓を寄せる。
+    """
+    flat = " ".join((body or "").split())
+    if len(flat) <= SNIPPET_LEN:
+        return flat
+
+    start = 0
+    if query:
+        hit = flat.lower().find(query.lower())
+        if hit > 0:
+            start = max(0, hit - SNIPPET_LEN // 3)
+    end = start + SNIPPET_LEN
+    return ("…" if start else "") + flat[start:end] + ("…" if end < len(flat) else "")
 
 
 def embed_query(text: str) -> bytes | None:
@@ -126,7 +154,7 @@ def search(q: str, limit: int = 20) -> dict:
         row["id"]: dict(row)
         for row in db.execute(
             f"""
-            SELECT i.id, i.uid, i.body, i.captured_at, i.status, i.file_path,
+            SELECT i.id, i.uid, i.body, i.captured_at, i.status, i.input_kind,
                    c.name AS cluster_name, c.uid AS cluster_uid
             FROM   ideas i
                    LEFT JOIN idea_clusters ic ON ic.idea_id = i.id
@@ -141,6 +169,8 @@ def search(q: str, limit: int = 20) -> dict:
     for idea_id, score in top:
         row = rows.get(idea_id)
         if row:
+            row["snippet"] = snippet(row.pop("body"), q.strip())
+            row.pop("id")
             results.append({**row, "score": round(score, 5)})
 
     return {
@@ -148,6 +178,174 @@ def search(q: str, limit: int = 20) -> dict:
         "vector": bool(vector_rank),
         "keyword": bool(keyword_rank),
         "results": results,
+    }
+
+
+@app.get("/api/ideas")
+def list_ideas(
+    status: str = "active",
+    cluster: str | None = None,
+    before: str | None = None,
+    limit: int = PAGE,
+) -> dict:
+    """新しい順のメモ一覧。
+
+    OFFSET ではなくキーセットページングにする。取り込みは常に先頭に入るので、
+    読んでいる最中に新着が来ると OFFSET では境界のメモが飛ぶ / 重複する。
+    """
+    limit = max(1, min(limit, MAX_PAGE))
+    db = connect()
+
+    filters: list[str] = []
+    params: list = []
+
+    if status == "active":
+        filters.append("i.status != 'archived'")
+    elif status in STATUSES:
+        filters.append("i.status = ?")
+        params.append(status)
+    elif status != "all":
+        raise HTTPException(400, "invalid status")
+
+    scope = None
+    if cluster == "none":
+        filters.append("ic.idea_id IS NULL")
+        scope = {"uid": "none", "name": None}
+    elif cluster:
+        row = db.execute(
+            "SELECT id, uid, name FROM clusters WHERE uid = ?", (cluster,)
+        ).fetchone()
+        if row is None:
+            raise HTTPException(404, "cluster not found")
+        filters.append("ic.cluster_id = ?")
+        params.append(row["id"])
+        scope = {"uid": row["uid"], "name": row["name"]}
+
+    where = ("WHERE " + " AND ".join(filters)) if filters else ""
+
+    # 総数は先頭ページでだけ数える。以降のページで数え直しても同じ値
+    total = None
+    if not before:
+        total = db.execute(
+            f"""
+            SELECT COUNT(*) AS n FROM ideas i
+                   LEFT JOIN idea_clusters ic ON ic.idea_id = i.id
+            {where}
+            """,
+            params,
+        ).fetchone()["n"]
+
+    page_params = list(params)
+    page_where = where
+    if before:
+        # captured_at は同じ秒が並びうるので id まで見て割る
+        at, sep, ident = before.partition("|")
+        if not sep or not ident.isdigit():
+            raise HTTPException(400, "invalid cursor")
+        page_where += (" AND " if filters else "WHERE ") + "(i.captured_at, i.id) < (?, ?)"
+        page_params += [at, int(ident)]
+
+    rows = db.execute(
+        f"""
+        SELECT i.id, i.uid, i.body, i.captured_at, i.status, i.input_kind,
+               c.uid AS cluster_uid, c.name AS cluster_name,
+               EXISTS (SELECT 1 FROM attachments a WHERE a.idea_id = i.id) AS attached
+        FROM   ideas i
+               LEFT JOIN idea_clusters ic ON ic.idea_id = i.id
+               LEFT JOIN clusters c ON c.id = ic.cluster_id
+        {page_where}
+        ORDER BY i.captured_at DESC, i.id DESC
+        LIMIT ?
+        """,
+        page_params + [limit],
+    ).fetchall()
+
+    ideas = []
+    for row in rows:
+        item = dict(row)
+        item["snippet"] = snippet(item.pop("body"))
+        item.pop("id")
+        ideas.append(item)
+
+    return {
+        "ideas": ideas,
+        "total": total,
+        "scope": scope,
+        # 端数ページなら次は無い。ちょうど埋まったときだけカーソルを返す
+        "next": f"{rows[-1]['captured_at']}|{rows[-1]['id']}" if len(rows) == limit else None,
+    }
+
+
+@app.get("/api/ideas/{uid}")
+def idea_detail(uid: str) -> dict:
+    """メモ 1 件。Obsidian で開くのと同じものをブラウザで読むための画面。"""
+    db = connect()
+    idea = db.execute(
+        """
+        SELECT i.id, i.uid, i.body, i.summary, i.captured_at, i.updated_at,
+               i.status, i.source, i.input_kind, i.file_path, i.parent_id,
+               c.uid AS cluster_uid, c.name AS cluster_name
+        FROM   ideas i
+               LEFT JOIN idea_clusters ic ON ic.idea_id = i.id
+               LEFT JOIN clusters c ON c.id = ic.cluster_id
+        WHERE  i.uid = ?
+        """,
+        (uid,),
+    ).fetchone()
+    if idea is None:
+        raise HTTPException(404, "idea not found")
+
+    idea_id = idea["id"]
+
+    attachments = [
+        {
+            "kind": row["kind"],
+            "bytes": row["bytes"],
+            "duration": json.loads(row["meta_json"] or "{}").get("duration"),
+        }
+        for row in db.execute(
+            "SELECT kind, bytes, meta_json FROM attachments WHERE idea_id = ? ORDER BY id",
+            (idea_id,),
+        )
+    ]
+
+    # 提案は保存していないので、ここに出るのは人が承認した関連だけ
+    related = db.execute(
+        """
+        SELECT o.uid, o.body, o.captured_at, r.kind, r.score
+        FROM   relations r
+               JOIN ideas o
+                 ON o.id = CASE WHEN r.src_id = ? THEN r.dst_id ELSE r.src_id END
+        WHERE  (r.src_id = ? OR r.dst_id = ?) AND r.verdict = 'confirmed'
+        ORDER BY o.captured_at DESC
+        """,
+        (idea_id, idea_id, idea_id),
+    ).fetchall()
+
+    parent = None
+    if idea["parent_id"]:
+        parent = db.execute(
+            "SELECT uid, body, captured_at FROM ideas WHERE id = ?", (idea["parent_id"],)
+        ).fetchone()
+
+    replies = db.execute(
+        "SELECT uid, body, captured_at FROM ideas WHERE parent_id = ? "
+        "ORDER BY captured_at",
+        (idea_id,),
+    ).fetchall()
+
+    def brief(row) -> dict:
+        item = dict(row)
+        item["snippet"] = snippet(item.pop("body"))
+        return item
+
+    detail = {k: idea[k] for k in idea.keys() if k not in ("id", "parent_id")}
+    return {
+        "idea": detail,
+        "attachments": attachments,
+        "related": [brief(r) for r in related],
+        "parent": brief(parent) if parent else None,
+        "replies": [brief(r) for r in replies],
     }
 
 
@@ -179,7 +377,11 @@ def clusters() -> dict:
 def cluster_detail(uid: str) -> dict:
     db = connect()
     cluster = db.execute(
-        "SELECT id, uid, name, summary, size FROM clusters WHERE uid = ?", (uid,)
+        """
+        SELECT id, uid, name, summary, size, updated_at, closed_at
+        FROM   clusters WHERE uid = ?
+        """,
+        (uid,),
     ).fetchone()
     if cluster is None:
         raise HTTPException(404, "cluster not found")
@@ -202,9 +404,14 @@ def cluster_detail(uid: str) -> dict:
         (cluster["id"],),
     ).fetchall()
 
+    def member(row) -> dict:
+        item = dict(row)
+        item["snippet"] = snippet(item.pop("body"))
+        return item
+
     return {
-        "cluster": dict(cluster),
-        "members": [dict(r) for r in members],
+        "cluster": {k: cluster[k] for k in cluster.keys() if k != "id"},
+        "members": [member(r) for r in members],
         "findings": [dict(r) for r in findings],
     }
 
@@ -215,7 +422,7 @@ class StatusUpdate(BaseModel):
 
 @app.post("/api/ideas/{uid}/status")
 def set_status(uid: str, payload: StatusUpdate) -> dict:
-    if payload.status not in ("inbox", "kept", "archived"):
+    if payload.status not in STATUSES:
         raise HTTPException(400, "invalid status")
 
     db = connect()
@@ -237,139 +444,391 @@ def set_status(uid: str, payload: StatusUpdate) -> dict:
 
 INDEX = """<!doctype html>
 <html lang="ja"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#161616" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<meta name="apple-mobile-web-app-title" content="idea">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='13' font-size='14'>&#128161;</text></svg>">
 <title>idea-memo</title>
 <style>
-  :root { color-scheme: light dark; --fg:#1a1a1a; --dim:#767676; --line:#e0e0e0; --bg:#fff; --accent:#3d5afe; }
+  :root { color-scheme: light dark; --fg:#1a1a1a; --dim:#767676; --line:#e0e0e0; --bg:#fff;
+          --accent:#3d5afe; --mark:#ffe9a8; --soft:#f6f6f6; }
   @media (prefers-color-scheme: dark) {
-    :root { --fg:#e8e8e8; --dim:#9a9a9a; --line:#333; --bg:#161616; --accent:#8c9eff; }
+    :root { --fg:#e8e8e8; --dim:#9a9a9a; --line:#333; --bg:#161616;
+            --accent:#8c9eff; --mark:#5b4a12; --soft:#1e1e1e; }
   }
-  * { box-sizing: border-box; }
-  body { margin:0; padding:1.5rem 1rem 4rem; max-width:52rem; margin-inline:auto;
-         font:15px/1.7 system-ui,-apple-system,"Hiragino Sans",sans-serif;
-         color:var(--fg); background:var(--bg); }
-  h1 { font-size:1rem; letter-spacing:.08em; color:var(--dim); font-weight:600; margin:0 0 1.2rem; }
-  nav { display:flex; gap:1rem; margin-bottom:1.2rem; }
-  nav button { background:none; border:none; padding:.3rem 0; cursor:pointer;
-               color:var(--dim); font:inherit; border-bottom:2px solid transparent; }
-  nav button[aria-current="true"] { color:var(--fg); border-color:var(--accent); }
-  input[type=search] { width:100%; padding:.7rem .9rem; font:inherit; color:var(--fg);
-                       background:transparent; border:1px solid var(--line); border-radius:8px; }
-  .card { border-bottom:1px solid var(--line); padding:.9rem 0; }
-  .meta { font-size:.8rem; color:var(--dim); display:flex; gap:.8rem; flex-wrap:wrap; }
-  .body { margin:.35rem 0; white-space:pre-wrap; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  body { margin:0; max-width:52rem; margin-inline:auto;
+         padding:0 max(1rem, env(safe-area-inset-left)) calc(3rem + env(safe-area-inset-bottom));
+         font:16px/1.7 system-ui,-apple-system,"Hiragino Sans",sans-serif;
+         color:var(--fg); background:var(--bg); -webkit-text-size-adjust:100%; }
+  header { position:sticky; top:0; z-index:2; background:var(--bg);
+           padding:calc(.8rem + env(safe-area-inset-top)) 0 0; }
+  h1 { font-size:.8rem; letter-spacing:.1em; color:var(--dim); font-weight:600; margin:0; }
+  h1 a { color:inherit; text-decoration:none; }
+  nav { display:flex; gap:1.2rem; border-bottom:1px solid var(--line); margin-top:.6rem; }
+  nav a { padding:.6rem 0; color:var(--dim); text-decoration:none;
+          border-bottom:2px solid transparent; margin-bottom:-1px; }
+  nav a[aria-current="page"] { color:var(--fg); border-color:var(--accent); }
+  input[type=search] { width:100%; padding:.8rem .9rem; font:inherit; color:var(--fg);
+                       background:transparent; border:1px solid var(--line); border-radius:10px;
+                       margin-top:1rem; }
+  .chips { display:flex; gap:.5rem; flex-wrap:wrap; margin:1rem 0 .3rem; }
+  .chips a { font-size:.8rem; text-decoration:none; color:var(--dim); padding:.3rem .8rem;
+             border:1px solid var(--line); border-radius:99px; }
+  .chips a[aria-current="page"] { color:var(--bg); background:var(--fg); border-color:var(--fg); }
+  .card { display:block; border-bottom:1px solid var(--line); padding:.9rem .2rem;
+          color:inherit; text-decoration:none; }
+  a.card:active { background:var(--soft); }
+  .meta { font-size:.8rem; color:var(--dim); display:flex; gap:.7rem; flex-wrap:wrap;
+          align-items:center; }
+  .body { margin:.35rem 0 0; white-space:pre-wrap; overflow-wrap:anywhere; }
+  .full { font-size:1.05rem; margin:1rem 0 1.5rem; }
   .tag { font-size:.75rem; border:1px solid var(--line); border-radius:99px; padding:.05rem .5rem; }
+  .name { color:var(--fg); font-weight:600; }
+  h2 { font-size:.8rem; letter-spacing:.06em; color:var(--dim); font-weight:600;
+       margin:2rem 0 .2rem; }
+  mark { background:var(--mark); color:inherit; border-radius:3px; }
   .stance-challenges { color:#e0642f; }
   .stance-supports { color:#2e9e5b; }
   /* 不要と判断した参考情報。テーマノートからは消えるが、俯瞰では残す */
   .dropped { opacity:.45; }
   a { color:var(--accent); }
   .empty { color:var(--dim); padding:2rem 0; }
-  .actions button { font-size:.75rem; margin-right:.4rem; cursor:pointer;
-                    background:none; border:1px solid var(--line); border-radius:5px;
-                    color:var(--dim); padding:.1rem .5rem; }
+  .back { display:inline-block; font-size:.85rem; color:var(--dim); text-decoration:none;
+          margin:1rem 0 .2rem; }
+  button { font:inherit; cursor:pointer; }
+  .more { width:100%; margin-top:1.2rem; padding:.8rem; background:none; color:var(--dim);
+          border:1px solid var(--line); border-radius:10px; }
+  .actions { display:flex; gap:.5rem; margin:1.5rem 0 0; }
+  .actions button { flex:1; padding:.6rem; font-size:.85rem; background:none;
+                    border:1px solid var(--line); border-radius:8px; color:var(--dim); }
+  .actions button[aria-pressed="true"] { color:var(--bg); background:var(--fg); border-color:var(--fg); }
 </style></head>
 <body>
-<h1>IDEA MEMO</h1>
-<nav>
-  <button id="tab-search" aria-current="true">検索</button>
-  <button id="tab-themes">テーマ</button>
-</nav>
-<div id="search-pane">
-  <input type="search" id="q" placeholder="キーワードでも、言い回しが違っても" autofocus>
-  <div id="results"></div>
-</div>
-<div id="themes-pane" hidden><div id="themes"></div></div>
+<header>
+  <h1><a href="#/">IDEA MEMO</a></h1>
+  <nav>
+    <a href="#/" data-tab="ideas">メモ</a>
+    <a href="#/search" data-tab="search">検索</a>
+    <a href="#/themes" data-tab="themes">テーマ</a>
+  </nav>
+</header>
+<main id="view"></main>
 
 <script>
 const $ = s => document.querySelector(s);
-const esc = s => (s ?? "").replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+const esc = s => String(s ?? "").replace(/[&<>"]/g,
+  c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 
-function showTab(name) {
-  $("#search-pane").hidden = name !== "search";
-  $("#themes-pane").hidden = name !== "themes";
-  $("#tab-search").setAttribute("aria-current", name === "search");
-  $("#tab-themes").setAttribute("aria-current", name === "themes");
-  if (name === "themes") loadThemes();
+/* 検索語だけを強調する。エスケープ後の文字列に手を入れると実体参照を
+   跨いで壊れるので、素のテキストを切りながらエスケープする */
+function mark(text, q) {
+  const src = String(text ?? "");
+  if (!q) return esc(src);
+  const hay = src.toLowerCase(), needle = q.toLowerCase();
+  let out = "", from = 0, hit;
+  while ((hit = hay.indexOf(needle, from)) !== -1) {
+    out += esc(src.slice(from, hit)) +
+           "<mark>" + esc(src.slice(hit, hit + needle.length)) + "</mark>";
+    from = hit + needle.length;
+  }
+  return out + esc(src.slice(from));
 }
-$("#tab-search").onclick = () => showTab("search");
-$("#tab-themes").onclick = () => showTab("themes");
 
-let timer;
-$("#q").oninput = e => {
-  clearTimeout(timer);
-  const q = e.target.value.trim();
-  if (!q) { $("#results").innerHTML = ""; return; }
-  timer = setTimeout(() => runSearch(q), 300);
+/* captured_at は UTC。読むのは手元の端末なので現地時間に直して出す */
+const fmtDay = iso => {
+  const d = new Date(iso);
+  return d.toLocaleDateString("ja-JP", d.getFullYear() === new Date().getFullYear()
+    ? {month:"numeric", day:"numeric", weekday:"short"}
+    : {year:"numeric", month:"numeric", day:"numeric"});
 };
+const fmtStamp = iso => new Date(iso).toLocaleString("ja-JP",
+  {year:"numeric", month:"numeric", day:"numeric", hour:"2-digit", minute:"2-digit"});
+
+const STATUS_LABEL = {inbox:"inbox", kept:"残す", archived:"archive"};
+const STANCE_MARK = {supports:"◯", challenges:"▲", neutral:"・"};
+
+/* 圏外や Pi の停止もここに来る。生の例外文言を出しても手当てのしようがないので、
+   「何が起きたか」だけを日本語で返す */
+async function api(path) {
+  let res;
+  try {
+    res = await fetch(path);
+  } catch (e) {
+    throw new Error("つながりませんでした（電波か Pi の状態を確認）");
+  }
+  if (res.status === 404) throw new Error("見つかりませんでした");
+  if (!res.ok) throw new Error(`読み込めませんでした (${res.status})`);
+  return res.json();
+}
+
+function show(html) {
+  $("#view").innerHTML = html;
+}
+
+// ------------------------------------------------------------
+// 部品
+// ------------------------------------------------------------
+function ideaCard(r, q) {
+  const kind = r.input_kind === "voice" ? '<span class="tag">音声</span>' : "";
+  return `
+    <a class="card" href="#/ideas/${encodeURIComponent(r.uid)}">
+      <div class="meta">
+        <span>${fmtDay(r.captured_at)}</span>
+        ${r.cluster_name ? `<span class="tag">${esc(r.cluster_name)}</span>` : ""}
+        ${kind}
+        ${r.status && r.status !== "inbox" ? `<span>${STATUS_LABEL[r.status]}</span>` : ""}
+      </div>
+      <div class="body">${mark(r.snippet, q)}</div>
+    </a>`;
+}
+
+const moreButton = (base, next) => next
+  ? `<button class="more" data-base="${esc(base)}" data-next="${esc(next)}">もっと読む</button>`
+  : "";
+
+function ideaList(items, q) {
+  if (!items.length) return '<p class="empty">まだ何もありません</p>';
+  return items.map(r => ideaCard(r, q)).join("");
+}
+
+// ------------------------------------------------------------
+// 画面: メモ一覧
+// ------------------------------------------------------------
+async function renderIdeas(params) {
+  const status = params.get("status") || "active";
+  const cluster = params.get("cluster") || "";
+
+  const chip = (value, label) => {
+    const qs = new URLSearchParams();
+    if (value !== "active") qs.set("status", value);
+    if (cluster) qs.set("cluster", cluster);
+    const href = "#/" + (qs.toString() ? "?" + qs : "");
+    return `<a href="${href}" ${status === value ? 'aria-current="page"' : ""}>${label}</a>`;
+  };
+
+  show(`
+    <div class="chips">
+      ${chip("active", "すべて")}${chip("inbox", "inbox")}
+      ${chip("kept", "残す")}${chip("archived", "archive")}
+    </div>
+    <div id="items"><p class="empty">読み込み中…</p></div>`);
+
+  const base = new URLSearchParams({status});
+  if (cluster) base.set("cluster", cluster);
+  const data = await api("/api/ideas?" + base);
+
+  const scope = data.scope
+    ? (data.scope.uid === "none" ? "未分類" : esc(data.scope.name || "(未命名のテーマ)"))
+    : null;
+  $("#items").innerHTML =
+    `<p class="meta">${scope ? `<span class="tag">${scope}</span>` : ""}${data.total} 件</p>` +
+    ideaList(data.ideas) + moreButton(base, data.next);
+}
+
+// ------------------------------------------------------------
+// 画面: メモ詳細
+// ------------------------------------------------------------
+async function renderIdea(uid) {
+  show('<p class="empty">読み込み中…</p>');
+  const d = await api(`/api/ideas/${encodeURIComponent(uid)}`);
+  const i = d.idea;
+
+  const brief = (r, label) => `
+    <a class="card" href="#/ideas/${encodeURIComponent(r.uid)}">
+      <div class="meta"><span>${fmtDay(r.captured_at)}</span>
+      ${label ? `<span class="tag">${label}</span>` : ""}</div>
+      <div class="body">${esc(r.snippet)}</div>
+    </a>`;
+
+  const attachments = d.attachments.map(a =>
+    `<span class="tag">${a.kind}${a.duration ? ` ${a.duration}s` : ""}</span>`).join(" ");
+
+  show(`
+    <a class="back" href="#/">← 一覧</a>
+    <div class="meta">
+      <span>${fmtStamp(i.captured_at)}</span>
+      <span>${i.source} / ${i.input_kind}</span>
+      ${attachments}
+    </div>
+    ${i.cluster_uid
+      ? `<div class="meta" style="margin-top:.4rem">テーマ
+           <a href="#/themes/${encodeURIComponent(i.cluster_uid)}">${esc(i.cluster_name || "(未命名)")}</a>
+         </div>`
+      : ""}
+    <div class="body full">${esc(i.body) || '<span class="empty">（文字起こし待ち）</span>'}</div>
+    <div class="actions">
+      ${["inbox", "kept", "archived"].map(s =>
+        `<button data-uid="${esc(i.uid)}" data-status="${s}"
+                 aria-pressed="${i.status === s}">${STATUS_LABEL[s]}</button>`).join("")}
+    </div>
+    ${d.parent ? "<h2>返信元</h2>" + brief(d.parent) : ""}
+    ${d.replies.length ? "<h2>追記</h2>" + d.replies.map(r => brief(r)).join("") : ""}
+    ${d.related.length
+      ? "<h2>関連メモ</h2>" + d.related.map(r => brief(r, r.kind)).join("")
+      : ""}
+    <p class="meta" style="margin-top:2rem">${esc(i.file_path)}</p>`);
+}
+
+// ------------------------------------------------------------
+// 画面: 検索
+// ------------------------------------------------------------
+let timer;
+
+function renderSearch(params) {
+  const q = params.get("q") || "";
+  show(`
+    <input type="search" id="q" enterkeyhint="search" autocomplete="off"
+           placeholder="キーワードでも、言い回しが違っても" value="${esc(q)}">
+    <div id="results"></div>`);
+  // iPhone でタブを踏んだだけでキーボードが出ないよう、空のときだけ焦点を置く
+  if (!q) $("#q").focus();
+  else runSearch(q);
+}
 
 async function runSearch(q) {
-  const data = await (await fetch(`/api/search?q=${encodeURIComponent(q)}`)).json();
-  if (!data.results.length) { $("#results").innerHTML = '<p class="empty">見つかりませんでした</p>'; return; }
-  const mode = [data.vector ? "ベクトル" : null, data.keyword ? "全文" : null].filter(Boolean).join(" + ");
-  $("#results").innerHTML =
-    `<p class="meta" style="margin:1rem 0 0">${data.results.length} 件 · ${mode}</p>` +
-    data.results.map(r => `
-      <div class="card">
-        <div class="meta">
-          <span>${r.captured_at.slice(0,10)}</span>
-          ${r.cluster_name ? `<span class="tag">${esc(r.cluster_name)}</span>` : ""}
-          <span>${r.status}</span>
-        </div>
-        <div class="body">${esc(r.body).slice(0,300)}</div>
-        <div class="actions">
-          <button onclick="setStatus('${r.uid}','kept',this)">残す</button>
-          <button onclick="setStatus('${r.uid}','archived',this)">archive</button>
-        </div>
-      </div>`).join("");
-}
-
-async function setStatus(uid, status, btn) {
-  await fetch(`/api/ideas/${uid}/status`, {
-    method: "POST", headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({status})
-  });
-  btn.parentElement.innerHTML = `<span class="meta">${status}</span>`;
-}
-
-async function loadThemes() {
-  const data = await (await fetch("/api/clusters")).json();
-  if (!data.clusters.length) {
-    $("#themes").innerHTML = '<p class="empty">まだテーマができていません。メモが溜まると夜間に生成されます。</p>';
+  $("#results").innerHTML = '<p class="empty">検索中…</p>';
+  let data;
+  try {
+    data = await api(`/api/search?q=${encodeURIComponent(q)}`);
+  } catch (e) {
+    $("#results").innerHTML = `<p class="empty">${esc(e.message)}</p>`;
     return;
   }
-  $("#themes").innerHTML =
-    `<p class="meta">未分類 ${data.unclustered} 件</p>` +
-    data.clusters.map(c => `
-      <div class="card">
-        <div class="meta">
-          <strong style="color:var(--fg)">${esc(c.name)}</strong>
-          <span>${c.size} 件</span>
-          ${c.findings ? `<span>参考情報 ${c.findings}</span>` : ""}
-        </div>
-        <div class="body">${esc(c.summary)}</div>
-        <button class="tag" onclick="loadCluster('${c.uid}', this)">開く</button>
-        <div class="detail"></div>
-      </div>`).join("");
+  if (!data.results.length) {
+    $("#results").innerHTML = '<p class="empty">見つかりませんでした</p>';
+    return;
+  }
+  const mode = [data.vector ? "ベクトル" : null, data.keyword ? "全文" : null]
+    .filter(Boolean).join(" + ");
+  $("#results").innerHTML =
+    `<p class="meta" style="margin:1rem 0 0">${data.results.length} 件 · ${mode}</p>` +
+    ideaList(data.results, q);
 }
 
-async function loadCluster(uid, btn) {
-  const box = btn.nextElementSibling;
-  if (box.innerHTML) { box.innerHTML = ""; return; }
-  const d = await (await fetch(`/api/clusters/${uid}`)).json();
-  box.innerHTML =
-    d.findings.map(f => `
-      <div class="card ${f.verdict === "not_useful" ? "dropped" : ""}" style="border:none;padding:.4rem 0">
-        <span class="stance-${f.stance}">${f.stance === "challenges" ? "▲" : f.stance === "supports" ? "◯" : "・"}</span>
-        <a href="${f.url}" target="_blank" rel="noreferrer">${esc(f.title)}</a>
-        <div class="meta">${esc(f.summary)}</div>
-      </div>`).join("") +
-    d.members.map(m => `
-      <div class="card" style="border:none;padding:.3rem 0">
-        <span class="meta">${m.captured_at.slice(0,10)}</span>
-        <div class="body">${esc(m.body).slice(0,200)}</div>
-      </div>`).join("");
+// ------------------------------------------------------------
+// 画面: テーマ
+// ------------------------------------------------------------
+async function renderThemes() {
+  show('<p class="empty">読み込み中…</p>');
+  const data = await api("/api/clusters");
+  const unclustered = `<p class="meta" style="margin:1rem 0 0">
+      <a href="#/?cluster=none">未分類 ${data.unclustered} 件</a></p>`;
+
+  if (!data.clusters.length) {
+    show(unclustered +
+      '<p class="empty">まだテーマができていません。話題が 2 つ以上に分かれると夜間に生成されます。</p>');
+    return;
+  }
+  show(unclustered + data.clusters.map(c => `
+    <a class="card" href="#/themes/${encodeURIComponent(c.uid)}">
+      <div class="meta">
+        <span class="name">${esc(c.name || "(未命名)")}</span>
+        <span>${c.size} 件</span>
+        ${c.findings ? `<span>参考情報 ${c.findings}</span>` : ""}
+      </div>
+      <div class="body">${esc(c.summary)}</div>
+    </a>`).join(""));
 }
+
+async function renderTheme(uid) {
+  show('<p class="empty">読み込み中…</p>');
+  const d = await api(`/api/clusters/${encodeURIComponent(uid)}`);
+  const c = d.cluster;
+
+  show(`
+    <a class="back" href="#/themes">← テーマ</a>
+    <h1 style="font-size:1.2rem;color:var(--fg);letter-spacing:0;margin:.4rem 0">
+      ${esc(c.name || "(未命名)")}</h1>
+    <div class="meta">${c.size} 件${c.closed_at ? " · 解散済み" : ""}
+      · 更新 ${fmtDay(c.updated_at)}</div>
+    ${c.summary ? `<div class="body full">${esc(c.summary)}</div>` : ""}
+    ${d.findings.length ? "<h2>参考情報</h2>" + d.findings.map(f => `
+      <div class="card">
+        <div>
+          <span class="stance-${f.stance}">${STANCE_MARK[f.stance] || "・"}</span>
+          <a href="${esc(f.url)}" target="_blank" rel="noreferrer">${esc(f.title || f.url)}</a>
+        </div>
+        <div class="meta">${esc(f.site || "")}</div>
+        <div class="body">${esc(f.summary || "")}</div>
+      </div>`).join("") : ""}
+    <h2>メモ</h2>
+    ${ideaList(d.members)}
+    <p class="meta" style="margin-top:1.2rem">
+      <a href="#/?cluster=${encodeURIComponent(c.uid)}&status=all">このテーマのメモを一覧で見る</a></p>`);
+}
+
+// ------------------------------------------------------------
+// ルーティング (ハッシュ。iPhone の戻るジェスチャで戻れる)
+// ------------------------------------------------------------
+async function route() {
+  const [path, query] = location.hash.replace(/^#\\/?/, "").split("?");
+  const params = new URLSearchParams(query || "");
+  const [head, arg] = [path.split("/")[0], decodeURIComponent(path.split("/")[1] || "")];
+
+  const tab = head === "search" ? "search" : head === "themes" ? "themes" : "ideas";
+  document.querySelectorAll("nav a").forEach(a => {
+    if (a.dataset.tab === tab) a.setAttribute("aria-current", "page");
+    else a.removeAttribute("aria-current");
+  });
+  window.scrollTo(0, 0);
+
+  try {
+    if (head === "search") return renderSearch(params);
+    if (head === "themes") return arg ? await renderTheme(arg) : await renderThemes();
+    if (head === "ideas" && arg) return await renderIdea(arg);
+    return await renderIdeas(params);
+  } catch (e) {
+    show(`<p class="empty">${esc(e.message)}</p>`);
+  }
+}
+
+addEventListener("hashchange", route);
+addEventListener("DOMContentLoaded", route);
+
+// 検索は打つたびにハッシュを積むと戻るが効かなくなるので replaceState で差し替える
+document.addEventListener("input", e => {
+  if (e.target.id !== "q") return;
+  clearTimeout(timer);
+  const q = e.target.value.trim();
+  history.replaceState(null, "", "#/search" + (q ? "?q=" + encodeURIComponent(q) : ""));
+  if (!q) { $("#results").innerHTML = ""; return; }
+  timer = setTimeout(() => runSearch(q), 300);
+});
+
+document.addEventListener("click", async e => {
+  const more = e.target.closest("button[data-base]");
+  if (more) {
+    const label = more.textContent;
+    more.textContent = "…";
+    try {
+      const data = await api(
+        `/api/ideas?${more.dataset.base}&before=${encodeURIComponent(more.dataset.next)}`);
+      more.outerHTML = ideaList(data.ideas) + moreButton(more.dataset.base, data.next);
+    } catch (err) {
+      more.textContent = label + "（失敗。もう一度）";
+    }
+    return;
+  }
+
+  const status = e.target.closest("button[data-status]");
+  if (status) {
+    try {
+      const res = await fetch(`/api/ideas/${encodeURIComponent(status.dataset.uid)}/status`, {
+        method: "POST", headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({status: status.dataset.status}),
+      });
+      if (!res.ok) throw new Error(res.status);
+    } catch (err) {
+      status.textContent = "失敗";       // 押したのに変わっていない、を見せる
+      return;
+    }
+    status.parentElement.querySelectorAll("button").forEach(b =>
+      b.setAttribute("aria-pressed", b === status));
+  }
+});
 </script>
 </body></html>
 """
