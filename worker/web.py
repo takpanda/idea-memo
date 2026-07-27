@@ -618,6 +618,24 @@ INDEX = """<!doctype html>
   .mini { font-size:.75rem; padding:.25rem .7rem; background:none; color:var(--dim);
           border:1px solid var(--line); border-radius:99px; white-space:nowrap; }
   .mini[aria-pressed="true"] { color:var(--bg); background:var(--fg); border-color:var(--fg); }
+  #theme-map { margin:1.5rem 0 .5rem; }
+  #theme-map svg { width:100%; height:auto; display:block; }
+  .link { fill:none; stroke:var(--line); }
+  .link-strong { stroke:var(--accent); stroke-width:2.5; }
+  .link-medium { stroke:var(--dim); stroke-width:1.5; stroke-dasharray:4,3; }
+  .link-weak { stroke:var(--dim); stroke-width:.8; stroke-dasharray:2,4; opacity:.5; }
+  .graph-node { cursor:pointer; }
+  .graph-node circle { fill:var(--accent); stroke:var(--bg); stroke-width:2; }
+  .graph-node text { font-size:.7rem; fill:var(--fg); }
+  .badge { font-size:.75rem; color:var(--accent); }
+  .theme-map-wrap { border:1px solid var(--line); border-radius:12px; padding:1rem; margin:1rem 0; }
+  .theme-map-wrap h2 { margin:0 0 .5rem; }
+  .theme-map-legend { display:flex; gap:1rem; flex-wrap:wrap; margin-top:.8rem; padding-top:.6rem; border-top:1px solid var(--line); font-size:.75rem; color:var(--dim); }
+  .theme-map-legend span { display:flex; align-items:center; gap:.4rem; }
+  .legend-line { display:inline-block; width:18px; height:0; vertical-align:middle; }
+  .legend-line.strong { border-top:2.5px solid var(--accent); }
+  .legend-line.medium { border-top:1.5px dashed var(--dim); }
+  .legend-line.weak { border-top:.8px dashed var(--dim); opacity:.5; }
 </style></head>
 <body>
 <header>
@@ -630,6 +648,7 @@ INDEX = """<!doctype html>
 </header>
 <main id="view"></main>
 
+<script src="https://d3js.org/d3.v7.min.js"></script>
 <script>
 const $ = s => document.querySelector(s);
 const esc = s => String(s ?? "").replace(/[&<>"]/g,
@@ -856,6 +875,21 @@ async function renderThemes(params) {
   const unclustered = `<p class="meta" style="margin:1.5rem 0 0">
       <a href="#/?cluster=none">未分類のメモ ${data.unclustered} 件</a></p>`;
 
+  // ネットワークグラフ用データを取得（APIが無ければ無視）
+  let networkData = null;
+  let edgeCount = {};
+  try {
+    networkData = await api("/api/clusters/network");
+    if (networkData && networkData.edges) {
+      networkData.edges.forEach(e => {
+        edgeCount[e.source] = (edgeCount[e.source] || 0) + 1;
+        edgeCount[e.target] = (edgeCount[e.target] || 0) + 1;
+      });
+    }
+  } catch (e) {
+    // ネットワークAPIがない or エラー → グラフ表示なし
+  }
+
   if (!data.clusters.length) {
     $("#items").innerHTML =
       '<p class="empty">まだテーマができていません。話題が 2 つ以上に分かれると夜間に生成されます。</p>'
@@ -868,6 +902,7 @@ async function renderThemes(params) {
       <div class="meta">
         <span class="name">${esc(c.name || "(未命名)")}</span>
         <span>${c.size} 件</span>
+        ${edgeCount[c.uid] ? `<span class="badge">⇄ ${edgeCount[c.uid]}</span>` : ""}
         <span>${fmtAgo(c.updated_at)}</span>
         ${c.challenges
           ? `<span class="warn">▲ 反証 ${c.challenges}</span>`
@@ -875,6 +910,16 @@ async function renderThemes(params) {
       </div>
       <div class="body clamp">${esc(c.summary)}</div>
     </a>`).join("") + unclustered;
+
+  // 条件を満たせばテーママップ枠＋グラフを挿入
+  if (networkData && networkData.nodes && networkData.nodes.length > 1
+      && networkData.edges && networkData.edges.length > 0) {
+    const wrap = document.createElement('div');
+    wrap.className = 'theme-map-wrap';
+    wrap.innerHTML = '<h2>テーママップ</h2><div id="theme-map"></div>';
+    $('#items').before(wrap);
+    renderNetworkGraph(networkData);
+  }
 }
 
 function finding(f) {
@@ -922,6 +967,67 @@ async function renderTheme(uid) {
 
   // 名前は差し替えたら再描画で読み直す。楽観更新するほどの頻度ではない
   $("#head").dataset.name = c.name || "";
+}
+
+// ------------------------------------------------------------
+// テーママップ (D3.js force-directed graph)
+// ------------------------------------------------------------
+function renderNetworkGraph(data) {
+  if (typeof d3 === 'undefined') return;
+  const el = document.getElementById('theme-map');
+  if (!el) return;
+
+  const w = el.clientWidth || 400;
+  const h = Math.min(400, Math.max(200, data.nodes.length * 36));
+
+  const svg = d3.select(el).append('svg')
+    .attr('viewBox', `0 0 ${w} ${h}`)
+    .attr('preserveAspectRatio', 'xMidYMid meet');
+
+  const links = data.edges.map(e => ({
+    source: e.source, target: e.target, strength: e.strength || 'weak'
+  }));
+  const nodes = data.nodes.map(n => ({...n}));
+
+  const simulation = d3.forceSimulation(nodes)
+    .force('link', d3.forceLink(links).id(d => d.id).distance(100))
+    .force('charge', d3.forceManyBody().strength(-300))
+    .force('center', d3.forceCenter(w / 2, h / 2))
+    .force('collide', d3.forceCollide().radius(d => 5 + Math.sqrt(d.size || 1) * 3));
+
+  const link = svg.append('g').selectAll('line').data(links).join('line')
+    .attr('class', d => `link link-${d.strength}`);
+
+  const node = svg.append('g').selectAll('g').data(nodes).join('g')
+    .attr('class', 'graph-node')
+    .on('click', (event, d) => {
+      event.stopPropagation();
+      location.hash = '#/themes/' + encodeURIComponent(d.id);
+    });
+
+  node.append('circle').attr('r', d => 4 + Math.sqrt(d.size || 1) * 3);
+  node.append('text')
+    .attr('dx', d => 8 + Math.sqrt(d.size || 1) * 3).attr('dy', 4)
+    .text(d => {
+      const name = d.name || '(未命名)';
+      const display = name.length > 18 ? name.slice(0, 16) + '…' : name;
+      const size = d.size != null ? ` · ${d.size}件` : '';
+      return display + size;
+    });
+
+  simulation.on('tick', () => {
+    link.attr('x1', d => d.source.x).attr('y1', d => d.source.y)
+        .attr('x2', d => d.target.x).attr('y2', d => d.target.y);
+    node.attr('transform', d => `translate(${d.x},${d.y})`);
+  });
+
+  // 強弱凡例
+  const legend = document.createElement('div');
+  legend.className = 'theme-map-legend';
+  legend.innerHTML = '<span><i class="legend-line strong"></i> 強い関連</span>'
+    + '<span><i class="legend-line medium"></i> 中程度</span>'
+    + '<span><i class="legend-line weak"></i> 弱い関連</span>';
+  el.after(legend);
 }
 
 // ------------------------------------------------------------
