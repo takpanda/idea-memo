@@ -193,8 +193,21 @@ class WebUI(unittest.TestCase):
         self.assertIn("text/html", res.headers["content-type"])
         for marker in ("IDEA MEMO", "#/search", "#/themes", "/api/ideas"):
             self.assertIn(marker, res.text)
-        # ビルドステップを持たない = 外部アセットを引かない
-        self.assertNotIn("<script src=", res.text)
+        # D3.js CDN だけは限定許容。それ以外の外部スクリプトは認めない
+        srcs = set()
+        pos = 0
+        while True:
+            tag = "<script src="
+            start = res.text.find(tag, pos)
+            if start == -1:
+                break
+            end = res.text.index(">", start)
+            src = res.text[start + len(tag) + 1:end - 1]
+            srcs.add(src)
+            pos = end + 1
+        expected_d3 = "https://d3js.org/d3.v7.min.js"
+        self.assertIn(expected_d3, srcs, "D3.js CDN が必要")
+        self.assertEqual(len(srcs), 1, f"D3.js 以外の外部スクリプトは禁止: {srcs - {expected_d3}}")
         self.assertNotIn("<link rel=\"stylesheet\"", res.text)
 
     # --- 3. メモ一覧 -----------------------------------------------------
