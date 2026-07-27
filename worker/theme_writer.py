@@ -99,11 +99,10 @@ def call_llm(memos: list[str]) -> dict | None:
     }
     if is_ollama:
         # OllamaのネイティブAPIでは構造化JSONとテンプレート無効化を
-        # トップレベルで指定する（/api/generateと同じAPI契約）。
+        # options に指定する。
         request_body.update({
             "format": "json",
-            "raw": True,
-            "options": {"temperature": 0.2, "num_predict": 2000},
+            "options": {"temperature": 0.2, "num_predict": 2000, "raw": True},
         })
     else:
         request_body.update({"temperature": 0.2, "max_tokens": 2000})
