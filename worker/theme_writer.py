@@ -98,11 +98,11 @@ def call_llm(memos: list[str]) -> dict | None:
         ],
     }
     if is_ollama:
-        # OllamaのネイティブAPIでは構造化JSONとテンプレート無効化を
-        # options に指定する。
+        # OllamaのネイティブAPIでは構造化JSONとthinking無効化を指定する。
         request_body.update({
             "format": "json",
-            "options": {"temperature": 0.2, "num_predict": 2000, "raw": True},
+            "think": False,
+            "options": {"temperature": 0.2, "num_predict": 2000},
         })
     else:
         request_body.update({"temperature": 0.2, "max_tokens": 2000})
