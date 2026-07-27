@@ -10,11 +10,13 @@ HTTP で叩く。埋め込みサーバーと LLM は tests/fake_services.py が�
 """
 
 import json
+import math
 import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "worker"))
@@ -551,6 +553,83 @@ class WebUI(unittest.TestCase):
         self.db.commit()
         missing = self.get("/api/clusters/network")
         self.assertEqual({node["id"] for node in missing["nodes"]}, set(expected))
+
+    def test_22_network_acceptance_counts_and_strength_boundaries(self) -> None:
+        """0/1/2 クラスタと、厳密な cosine 閾値を API レベルで固定する。"""
+        import web
+
+        open_rows = self.db.execute(
+            "SELECT id, uid, size, closed_at FROM clusters WHERE size > 0 ORDER BY id"
+        ).fetchall()
+        self.assertGreaterEqual(len(open_rows), 2)
+        original_closed = {row["id"]: row["closed_at"] for row in open_rows}
+        extra_ids = []
+
+        try:
+            with self.db:
+                self.db.execute(
+                    "UPDATE clusters SET closed_at = '2099-01-01T00:00:00Z' "
+                    "WHERE size > 0"
+                )
+            self.assertEqual(self.get("/api/clusters/network"),
+                             {"nodes": [], "edges": [], "noiseNear": []})
+
+            first_id = open_rows[0]["id"]
+            with self.db:
+                self.db.execute(
+                    "UPDATE clusters SET closed_at = NULL WHERE id = ?", (first_id,)
+                )
+            one = self.get("/api/clusters/network")
+            self.assertEqual(len(one["nodes"]), 1)
+            self.assertEqual(one["edges"], [])
+
+            second_id = open_rows[1]["id"]
+            with self.db:
+                self.db.execute(
+                    "UPDATE clusters SET closed_at = NULL WHERE id = ?", (second_id,)
+                )
+            two = self.get("/api/clusters/network")
+            self.assertEqual(len(two["nodes"]), 2)
+            self.assertIsInstance(two["edges"], list)
+
+            # 1 本の基準ベクトルに対し、各値が閾値の上下と境界になるようにする。
+            base = open_rows[0]["id"]
+            boundary_values = (0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2)
+            for index in range(len(boundary_values)):
+                cur = self.db.execute(
+                    "INSERT INTO clusters(uid, size, member_hash, members_json) "
+                    "VALUES (?, 1, '', '[]')",
+                    (f"network-boundary-{index}",),
+                )
+                extra_ids.append(cur.lastrowid)
+            self.db.commit()
+
+            fixed = {base: [1.0, 0.0]}
+            for cluster_id, similarity in zip(extra_ids, boundary_values):
+                fixed[cluster_id] = [similarity, math.sqrt(1 - similarity ** 2)]
+            with patch.object(web, "_cluster_centroids", return_value=fixed):
+                data = self.get("/api/clusters/network")
+
+            edges = {
+                edge["target"]: edge["strength"]
+                for edge in data["edges"]
+                if edge["source"] == open_rows[0]["uid"]
+            }
+            self.assertEqual(
+                [edges.get(f"network-boundary-{index}") for index in range(7)],
+                ["strong", "medium", "medium", "weak", "weak", None, None],
+            )
+        finally:
+            with self.db:
+                self.db.executemany(
+                    "UPDATE clusters SET closed_at = ? WHERE id = ?",
+                    [(original_closed[row_id], row_id) for row_id in original_closed],
+                )
+                if extra_ids:
+                    placeholders = ",".join("?" * len(extra_ids))
+                    self.db.execute(
+                        f"DELETE FROM clusters WHERE id IN ({placeholders})", extra_ids
+                    )
 
 
 if __name__ == "__main__":
