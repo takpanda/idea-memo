@@ -194,8 +194,14 @@ RRF (Reciprocal Rank Fusion) で統合。ただし **trigram は 3 文字未満�
 あるのはブラウザだけ**という状況が実際には多い。そこで一覧・本文・返信の連なりまで
 Web UI に持たせた。Obsidian は母艦のまま、Web UI は「読める側」に広げる位置づけ。
 
-書き込みは status の変更だけに留める。本文編集を入れると Markdown と DB の
-双方向同期が必要になり、「正本は DB、Markdown は再生成」という前提が崩れる。
+書き込みは status の変更・テーマ名・参考情報の当たり外れ (`findings.verdict`) に
+留める。いずれも DB を更新して Markdown を再生成する一方向で、Telegram の
+inline keyboard で既にできることを外出先でも押せるようにしたもの。本文編集だけは
+入れない。Markdown と DB の双方向同期が必要になり、「正本は DB、Markdown は再生成」
+という前提が崩れるため。
+
+テーマ名は Web UI から付けた時点で `name_locked` を立てる。立てないと次の
+`theme_writer` が LLM の名前で上書きし、押した意味がなくなる。
 
 - **ハッシュルーティング** — `#/ideas/<uid>` のような URL で画面を表す。iPhone の
   戻るジェスチャがそのまま効き、検索結果の URL を共有もできる。検索語の反映は
