@@ -730,8 +730,8 @@ INDEX = """<!doctype html>
   .link-medium { stroke:var(--dim); stroke-width:1.5; stroke-dasharray:4,3; }
   .link-weak { stroke:var(--dim); stroke-width:.8; stroke-dasharray:2,4; opacity:.5; }
   .graph-node { cursor:pointer; }
-  .graph-node circle { fill:var(--accent); stroke:var(--bg); stroke-width:2; }
-  .graph-node text { font-size:.7rem; fill:var(--fg); }
+  .graph-node circle { stroke:var(--bg); stroke-width:2; }
+  .graph-node text { font-size:.7rem; fill:var(--fg); pointer-events:none; }
   .badge { font-size:.75rem; color:var(--accent); }
   .theme-map-wrap { border:1px solid var(--line); border-radius:12px; padding:1rem; margin:1rem 0; }
   .theme-map-wrap h2 { margin:0 0 .5rem; }
@@ -1075,56 +1075,102 @@ async function renderTheme(uid) {
 }
 
 // ------------------------------------------------------------
-// テーママップ (D3.js force-directed graph)
+// D3 force-directed graph コンポーネント
+// Observable https://observablehq.com/@d3/force-directed-graph を参照
 // ------------------------------------------------------------
+function forceGraph(container, { nodes, links, width, height }) {
+  const svg = d3.select(container)
+    .append('svg')
+    .attr('viewBox', [0, 0, width, height])
+    .attr('preserveAspectRatio', 'xMidYMid meet');
+
+  // 矢印マーカー（装飾のみ。APIのエッジは無向）
+  svg.append('defs').selectAll('marker')
+    .data(['arrow'])
+    .join('marker')
+    .attr('id', 'arrow')
+    .attr('viewBox', '0 -5 10 10')
+    .attr('refX', 22)
+    .attr('refY', 0)
+    .attr('markerWidth', 6)
+    .attr('markerHeight', 6)
+    .attr('orient', 'auto')
+    .append('path')
+    .attr('d', 'M0,-5L10,0L0,5')
+    .attr('fill', '#999');
+
+  const simulation = d3.forceSimulation(nodes)
+    .force('link', d3.forceLink(links).id(d => d.id).distance(120))
+    .force('charge', d3.forceManyBody().strength(-400))
+    .force('center', d3.forceCenter(width / 2, height / 2))
+    .force('collide', d3.forceCollide().radius(d => 10 + Math.sqrt(d.size || 1) * 4));
+
+  const link = svg.append('g').selectAll('line').data(links).join('line')
+    .attr('class', d => `link link-${d.strength}`)
+    .attr('marker-end', 'url(#arrow)');
+
+  const node = svg.append('g').selectAll('g').data(nodes).join('g')
+    .attr('class', 'graph-node')
+    .call(d3.drag()
+      .on('start', (event, d) => {
+        if (!event.active) simulation.alphaTarget(0.3).restart();
+        d.fx = d.x;
+        d.fy = d.y;
+      })
+      .on('drag', (event, d) => {
+        d.fx = event.x;
+        d.fy = event.y;
+      })
+      .on('end', (event, d) => {
+        if (!event.active) simulation.alphaTarget(0);
+        d.fx = null;
+        d.fy = null;
+      }))
+    .on('click', (event, d) => {
+      if (event.defaultPrevented) return;  // drag時は無視
+      event.stopPropagation();
+      location.hash = '#/themes/' + encodeURIComponent(d.id);
+    });
+
+  node.append('circle')
+    .attr('r', d => 5 + Math.sqrt(d.size || 1) * 4)
+    .attr('fill', d => d.color);
+
+  node.append('text')
+    .attr('dx', d => 12 + Math.sqrt(d.size || 1) * 4)
+    .attr('dy', 4)
+    .text(d => {
+      const name = d.name || '(未命名)';
+      const label = name.length > 14 ? name.slice(0, 12) + '…' : name;
+      return `${label} · ${d.size}件`;
+    });
+
+  simulation.on('tick', () => {
+    link
+      .attr('x1', d => d.source.x)
+      .attr('y1', d => d.source.y)
+      .attr('x2', d => d.target.x)
+      .attr('y2', d => d.target.y);
+    node.attr('transform', d => `translate(${d.x},${d.y})`);
+  });
+
+  return simulation;
+}
+
 function renderNetworkGraph(data) {
   if (typeof d3 === 'undefined') return;
   const el = document.getElementById('theme-map');
   if (!el) return;
 
   const w = el.clientWidth || 400;
-  const h = Math.min(400, Math.max(200, data.nodes.length * 36));
-
-  const svg = d3.select(el).append('svg')
-    .attr('viewBox', `0 0 ${w} ${h}`)
-    .attr('preserveAspectRatio', 'xMidYMid meet');
+  const h = Math.min(450, Math.max(250, data.nodes.length * 40));
 
   const links = data.edges.map(e => ({
     source: e.source, target: e.target, strength: e.strength || 'weak'
   }));
   const nodes = data.nodes.map(n => ({...n}));
 
-  const simulation = d3.forceSimulation(nodes)
-    .force('link', d3.forceLink(links).id(d => d.id).distance(100))
-    .force('charge', d3.forceManyBody().strength(-300))
-    .force('center', d3.forceCenter(w / 2, h / 2))
-    .force('collide', d3.forceCollide().radius(d => 5 + Math.sqrt(d.size || 1) * 3));
-
-  const link = svg.append('g').selectAll('line').data(links).join('line')
-    .attr('class', d => `link link-${d.strength}`);
-
-  const node = svg.append('g').selectAll('g').data(nodes).join('g')
-    .attr('class', 'graph-node')
-    .on('click', (event, d) => {
-      event.stopPropagation();
-      location.hash = '#/themes/' + encodeURIComponent(d.id);
-    });
-
-  node.append('circle').attr('r', d => 4 + Math.sqrt(d.size || 1) * 3);
-  node.append('text')
-    .attr('dx', d => 8 + Math.sqrt(d.size || 1) * 3).attr('dy', 4)
-    .text(d => {
-      const name = d.name || '(未命名)';
-      const display = name.length > 18 ? name.slice(0, 16) + '…' : name;
-      const size = d.size != null ? ` · ${d.size}件` : '';
-      return display + size;
-    });
-
-  simulation.on('tick', () => {
-    link.attr('x1', d => d.source.x).attr('y1', d => d.source.y)
-        .attr('x2', d => d.target.x).attr('y2', d => d.target.y);
-    node.attr('transform', d => `translate(${d.x},${d.y})`);
-  });
+  forceGraph(el, { nodes, links, width: w, height: h });
 
   // 強弱凡例
   const legend = document.createElement('div');
