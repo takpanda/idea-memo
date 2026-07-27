@@ -32,8 +32,17 @@ RRF_K = 60          # Reciprocal Rank Fusion の定数。慣例値
 POOL = 30
 PAGE = 30
 MAX_PAGE = 100
+MEMBER_PAGE = 20      # テーマ詳細の初期表示。続きは /api/ideas のページングに任せる
 SNIPPET_LEN = 140
 STATUSES = ("inbox", "kept", "archived")
+VERDICTS = ("useful", "not_useful")
+
+# テーマ一覧の並び。既定はサイズ順 (大きい話題から見る)
+CLUSTER_ORDER = {
+    "size": "c.size DESC, c.updated_at DESC",
+    "recent": "c.updated_at DESC, c.size DESC",
+    "name": "c.name COLLATE NOCASE, c.size DESC",
+}
 
 app = FastAPI(title="idea-memo")
 
@@ -248,7 +257,7 @@ def list_ideas(
     rows = db.execute(
         f"""
         SELECT i.id, i.uid, i.body, i.captured_at, i.status, i.input_kind,
-               c.uid AS cluster_uid, c.name AS cluster_name,
+               c.uid AS cluster_uid, c.name AS cluster_name, ic.probability,
                EXISTS (SELECT 1 FROM attachments a WHERE a.idea_id = i.id) AS attached
         FROM   ideas i
                LEFT JOIN idea_clusters ic ON ic.idea_id = i.id
@@ -350,15 +359,29 @@ def idea_detail(uid: str) -> dict:
 
 
 @app.get("/api/clusters")
-def clusters() -> dict:
+def clusters(sort: str = "size") -> dict:
+    """テーマ一覧。
+
+    参考情報は件数だけでなく反証 (challenges) の数も返す。一覧で見たいのは
+    「賛成材料が何件あるか」ではなく「反証が来ているテーマはどれか」なので。
+    外したものは両方の数から除く。
+    """
+    if sort not in CLUSTER_ORDER:
+        raise HTTPException(400, "invalid sort")
+
     db = connect()
     rows = db.execute(
-        """
+        f"""
         SELECT c.uid, c.name, c.summary, c.size, c.updated_at,
-               (SELECT COUNT(*) FROM findings f WHERE f.cluster_id = c.id) AS findings
+               (SELECT COUNT(*) FROM findings f
+                WHERE  f.cluster_id = c.id
+                       AND (f.verdict IS NULL OR f.verdict = 'useful')) AS findings,
+               (SELECT COUNT(*) FROM findings f
+                WHERE  f.cluster_id = c.id AND f.stance = 'challenges'
+                       AND (f.verdict IS NULL OR f.verdict = 'useful')) AS challenges
         FROM   clusters c
         WHERE  c.closed_at IS NULL AND c.size > 0
-        ORDER BY c.size DESC
+        ORDER BY {CLUSTER_ORDER[sort]}
         """
     ).fetchall()
 
@@ -370,7 +393,7 @@ def clusters() -> dict:
         """
     ).fetchone()["n"]
 
-    return {"clusters": [dict(r) for r in rows], "unclustered": noise}
+    return {"clusters": [dict(r) for r in rows], "unclustered": noise, "sort": sort}
 
 
 @app.get("/api/clusters/{uid}")
@@ -386,20 +409,29 @@ def cluster_detail(uid: str) -> dict:
     if cluster is None:
         raise HTTPException(404, "cluster not found")
 
+    # 大きいテーマで全メンバーを一度に描かない。続きは /api/ideas?cluster=... の
+    # キーセットページングに載せるので、並び順をそちらと揃えておく
     members = db.execute(
         """
-        SELECT i.uid, i.body, i.captured_at, i.status, ic.probability
+        SELECT i.id, i.uid, i.body, i.captured_at, i.status, i.input_kind,
+               ic.probability
         FROM   idea_clusters ic JOIN ideas i ON i.id = ic.idea_id
-        WHERE  ic.cluster_id = ? ORDER BY i.captured_at DESC
+        WHERE  ic.cluster_id = ?
+        ORDER BY i.captured_at DESC, i.id DESC
+        LIMIT ?
         """,
-        (cluster["id"],),
+        (cluster["id"], MEMBER_PAGE + 1),
     ).fetchall()
+
+    more = len(members) > MEMBER_PAGE
+    members = members[:MEMBER_PAGE]
 
     findings = db.execute(
         """
-        SELECT title, url, site, summary, stance, query_kind, verdict
+        SELECT id, title, url, site, summary, stance, query_kind, verdict
         FROM   findings WHERE cluster_id = ?
-        ORDER BY stance = 'challenges' DESC, fetched_at DESC
+        -- 外したものは消さずに末尾へ送る。反証を先頭に置くのはその次
+        ORDER BY verdict = 'not_useful', stance = 'challenges' DESC, fetched_at DESC
         """,
         (cluster["id"],),
     ).fetchall()
@@ -407,13 +439,82 @@ def cluster_detail(uid: str) -> dict:
     def member(row) -> dict:
         item = dict(row)
         item["snippet"] = snippet(item.pop("body"))
+        item.pop("id")
         return item
 
     return {
         "cluster": {k: cluster[k] for k in cluster.keys() if k != "id"},
         "members": [member(r) for r in members],
+        "members_next": (
+            f"{members[-1]['captured_at']}|{members[-1]['id']}" if more else None
+        ),
         "findings": [dict(r) for r in findings],
     }
+
+
+class NameUpdate(BaseModel):
+    name: str
+
+
+@app.post("/api/clusters/{uid}/name")
+def rename_cluster(uid: str, payload: NameUpdate) -> dict:
+    """テーマ名を人が付け直す。
+
+    付けた時点で name_locked を立てる。ここで立てないと次の theme_writer が
+    LLM の名前で上書きしてしまい、押した意味がなくなる。
+    """
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(400, "empty name")
+
+    db = connect()
+    row = db.execute("SELECT id FROM clusters WHERE uid = ?", (uid,)).fetchone()
+    if row is None:
+        raise HTTPException(404, "cluster not found")
+
+    with db:
+        db.execute(
+            "UPDATE clusters SET name = ?, name_locked = 1, "
+            "updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?",
+            (name, row["id"]),
+        )
+
+    from common import write_theme_markdown
+
+    write_theme_markdown(db, row["id"])
+    return {"uid": uid, "name": name, "name_locked": 1}
+
+
+class VerdictUpdate(BaseModel):
+    verdict: str | None
+
+
+@app.post("/api/findings/{finding_id}/verdict")
+def set_verdict(finding_id: int, payload: VerdictUpdate) -> dict:
+    """参考情報の当たり外れを記録する。
+
+    行は消さない。テーマノートからは落ちる (write_theme_markdown が not_useful を
+    除く) が、俯瞰では薄く残して「一度見て外した」ことが分かるようにする。
+    """
+    if payload.verdict is not None and payload.verdict not in VERDICTS:
+        raise HTTPException(400, "invalid verdict")
+
+    db = connect()
+    row = db.execute(
+        "SELECT cluster_id FROM findings WHERE id = ?", (finding_id,)
+    ).fetchone()
+    if row is None:
+        raise HTTPException(404, "finding not found")
+
+    with db:
+        db.execute(
+            "UPDATE findings SET verdict = ? WHERE id = ?", (payload.verdict, finding_id)
+        )
+
+    from common import write_theme_markdown
+
+    write_theme_markdown(db, row["cluster_id"])
+    return {"id": finding_id, "verdict": payload.verdict}
 
 
 class StatusUpdate(BaseModel):
@@ -505,6 +606,18 @@ INDEX = """<!doctype html>
   .actions button { flex:1; padding:.6rem; font-size:.85rem; background:none;
                     border:1px solid var(--line); border-radius:8px; color:var(--dim); }
   .actions button[aria-pressed="true"] { color:var(--bg); background:var(--fg); border-color:var(--fg); }
+  /* 一覧をスキャンできるよう、要約は 2 行で頭打ちにする */
+  .clamp { display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical;
+           overflow:hidden; }
+  .warn { color:#e0642f; }
+  .title { display:flex; align-items:baseline; gap:.6rem; margin:.4rem 0; }
+  .title h1 { font-size:1.2rem; color:var(--fg); letter-spacing:0; flex:1; }
+  .title input { flex:1; min-width:0; font:inherit; font-size:1.1rem; color:var(--fg);
+                 background:transparent; border:1px solid var(--line); border-radius:8px;
+                 padding:.4rem .6rem; }
+  .mini { font-size:.75rem; padding:.25rem .7rem; background:none; color:var(--dim);
+          border:1px solid var(--line); border-radius:99px; white-space:nowrap; }
+  .mini[aria-pressed="true"] { color:var(--bg); background:var(--fg); border-color:var(--fg); }
 </style></head>
 <body>
 <header>
@@ -547,8 +660,20 @@ const fmtDay = iso => {
 const fmtStamp = iso => new Date(iso).toLocaleString("ja-JP",
   {year:"numeric", month:"numeric", day:"numeric", hour:"2-digit", minute:"2-digit"});
 
+/* テーマの「止まっている / 動いている」は日付そのものより経過で掴む */
+const fmtAgo = iso => {
+  const days = Math.floor((Date.now() - new Date(iso)) / 86400000);
+  if (days <= 0) return "今日";
+  if (days === 1) return "昨日";
+  if (days < 7) return `${days} 日前`;
+  if (days < 31) return `${Math.floor(days / 7)} 週間前`;
+  return `${Math.floor(days / 30)} ヶ月前`;
+};
+
 const STATUS_LABEL = {inbox:"inbox", kept:"残す", archived:"archive"};
 const STANCE_MARK = {supports:"◯", challenges:"▲", neutral:"・"};
+const KIND_LABEL = {prior_art:"前例", evidence:"裏付け", counter:"反証"};
+const SORT_LABEL = {size:"大きい順", recent:"最近動いた", name:"名前"};
 
 /* 圏外や Pi の停止もここに来る。生の例外文言を出しても手当てのしようがないので、
    「何が起きたか」だけを日本語で返す */
@@ -573,12 +698,15 @@ function show(html) {
 // ------------------------------------------------------------
 function ideaCard(r, q) {
   const kind = r.input_kind === "voice" ? '<span class="tag">音声</span>' : "";
+  // HDBSCAN の所属確率。低いものは「たまたま寄っただけ」を疑いながら読む
+  const edge = r.probability != null && r.probability < 0.5
+    ? '<span class="tag">周辺</span>' : "";
   return `
     <a class="card" href="#/ideas/${encodeURIComponent(r.uid)}">
       <div class="meta">
         <span>${fmtDay(r.captured_at)}</span>
         ${r.cluster_name ? `<span class="tag">${esc(r.cluster_name)}</span>` : ""}
-        ${kind}
+        ${kind}${edge}
         ${r.status && r.status !== "inbox" ? `<span>${STATUS_LABEL[r.status]}</span>` : ""}
       </div>
       <div class="body">${mark(r.snippet, q)}</div>
@@ -711,53 +839,89 @@ async function runSearch(q) {
 // ------------------------------------------------------------
 // 画面: テーマ
 // ------------------------------------------------------------
-async function renderThemes() {
-  show('<p class="empty">読み込み中…</p>');
-  const data = await api("/api/clusters");
-  const unclustered = `<p class="meta" style="margin:1rem 0 0">
-      <a href="#/?cluster=none">未分類 ${data.unclustered} 件</a></p>`;
+async function renderThemes(params) {
+  const sort = SORT_LABEL[params.get("sort")] ? params.get("sort") : "size";
+
+  const chip = (value) =>
+    `<a href="#/themes?sort=${value}" ${sort === value ? 'aria-current="page"' : ""}
+      >${SORT_LABEL[value]}</a>`;
+
+  show(`
+    <div class="chips">${chip("size")}${chip("recent")}${chip("name")}</div>
+    <div id="items"><p class="empty">読み込み中…</p></div>`);
+
+  const data = await api("/api/clusters?sort=" + sort);
+
+  // 未分類は行き止まりではなく脇道。上に置くとテーマより先に目に入ってしまう
+  const unclustered = `<p class="meta" style="margin:1.5rem 0 0">
+      <a href="#/?cluster=none">未分類のメモ ${data.unclustered} 件</a></p>`;
 
   if (!data.clusters.length) {
-    show(unclustered +
-      '<p class="empty">まだテーマができていません。話題が 2 つ以上に分かれると夜間に生成されます。</p>');
+    $("#items").innerHTML =
+      '<p class="empty">まだテーマができていません。話題が 2 つ以上に分かれると夜間に生成されます。</p>'
+      + unclustered;
     return;
   }
-  show(unclustered + data.clusters.map(c => `
+
+  $("#items").innerHTML = data.clusters.map(c => `
     <a class="card" href="#/themes/${encodeURIComponent(c.uid)}">
       <div class="meta">
         <span class="name">${esc(c.name || "(未命名)")}</span>
         <span>${c.size} 件</span>
-        ${c.findings ? `<span>参考情報 ${c.findings}</span>` : ""}
+        <span>${fmtAgo(c.updated_at)}</span>
+        ${c.challenges
+          ? `<span class="warn">▲ 反証 ${c.challenges}</span>`
+          : c.findings ? `<span>参考情報 ${c.findings}</span>` : ""}
       </div>
-      <div class="body">${esc(c.summary)}</div>
-    </a>`).join(""));
+      <div class="body clamp">${esc(c.summary)}</div>
+    </a>`).join("") + unclustered;
+}
+
+function finding(f) {
+  const button = (verdict, label) =>
+    `<button class="mini" data-verdict="${verdict}"
+             aria-pressed="${f.verdict === verdict}">${label}</button>`;
+  return `
+    <div class="card ${f.verdict === "not_useful" ? "dropped" : ""}" data-finding="${f.id}">
+      <div>
+        <span class="stance-${f.stance}">${STANCE_MARK[f.stance] || "・"}</span>
+        <a href="${esc(f.url)}" target="_blank" rel="noreferrer">${esc(f.title || f.url)}</a>
+      </div>
+      <div class="meta">
+        ${KIND_LABEL[f.query_kind] ? `<span class="tag">${KIND_LABEL[f.query_kind]}</span>` : ""}
+        <span>${esc(f.site || "")}</span>
+      </div>
+      <div class="body clamp">${esc(f.summary || "")}</div>
+      <div class="meta" style="margin-top:.5rem">
+        ${button("useful", "役に立った")}${button("not_useful", "外す")}
+      </div>
+    </div>`;
 }
 
 async function renderTheme(uid) {
   show('<p class="empty">読み込み中…</p>');
   const d = await api(`/api/clusters/${encodeURIComponent(uid)}`);
   const c = d.cluster;
+  const base = new URLSearchParams({status: "all", cluster: c.uid});
 
   show(`
     <a class="back" href="#/themes">← テーマ</a>
-    <h1 style="font-size:1.2rem;color:var(--fg);letter-spacing:0;margin:.4rem 0">
-      ${esc(c.name || "(未命名)")}</h1>
+    <div class="title" id="head">
+      <h1>${esc(c.name || "(未命名)")}</h1>
+      <button class="mini" id="rename" data-uid="${esc(c.uid)}">名前を変える</button>
+    </div>
     <div class="meta">${c.size} 件${c.closed_at ? " · 解散済み" : ""}
-      · 更新 ${fmtDay(c.updated_at)}</div>
+      · 更新 ${fmtAgo(c.updated_at)}</div>
     ${c.summary ? `<div class="body full">${esc(c.summary)}</div>` : ""}
-    ${d.findings.length ? "<h2>参考情報</h2>" + d.findings.map(f => `
-      <div class="card">
-        <div>
-          <span class="stance-${f.stance}">${STANCE_MARK[f.stance] || "・"}</span>
-          <a href="${esc(f.url)}" target="_blank" rel="noreferrer">${esc(f.title || f.url)}</a>
-        </div>
-        <div class="meta">${esc(f.site || "")}</div>
-        <div class="body">${esc(f.summary || "")}</div>
-      </div>`).join("") : ""}
     <h2>メモ</h2>
     ${ideaList(d.members)}
+    ${moreButton(base, d.members_next)}
+    ${d.findings.length ? "<h2>参考情報</h2>" + d.findings.map(finding).join("") : ""}
     <p class="meta" style="margin-top:1.2rem">
       <a href="#/?cluster=${encodeURIComponent(c.uid)}&status=all">このテーマのメモを一覧で見る</a></p>`);
+
+  // 名前は差し替えたら再描画で読み直す。楽観更新するほどの頻度ではない
+  $("#head").dataset.name = c.name || "";
 }
 
 // ------------------------------------------------------------
@@ -777,7 +941,7 @@ async function route() {
 
   try {
     if (head === "search") return renderSearch(params);
-    if (head === "themes") return arg ? await renderTheme(arg) : await renderThemes();
+    if (head === "themes") return arg ? await renderTheme(arg) : await renderThemes(params);
     if (head === "ideas" && arg) return await renderIdea(arg);
     return await renderIdeas(params);
   } catch (e) {
@@ -806,10 +970,72 @@ document.addEventListener("click", async e => {
     try {
       const data = await api(
         `/api/ideas?${more.dataset.base}&before=${encodeURIComponent(more.dataset.next)}`);
+      // テーマの中では所属テーマ名のタグは自明なので落とす
+      if (new URLSearchParams(more.dataset.base).has("cluster")) {
+        data.ideas.forEach(r => { r.cluster_name = null; });
+      }
       more.outerHTML = ideaList(data.ideas) + moreButton(more.dataset.base, data.next);
     } catch (err) {
       more.textContent = label + "（失敗。もう一度）";
     }
+    return;
+  }
+
+  const rename = e.target.closest("#rename");
+  if (rename) {
+    const head = $("#head");
+    head.innerHTML = `
+      <input id="tname" value="${esc(head.dataset.name)}" enterkeyhint="done"
+             autocomplete="off" placeholder="テーマ名">
+      <button class="mini" id="tsave" data-uid="${esc(rename.dataset.uid)}">保存</button>
+      <button class="mini" id="tcancel">やめる</button>`;
+    $("#tname").focus();
+    return;
+  }
+
+  if (e.target.closest("#tcancel")) return route();
+
+  const save = e.target.closest("#tsave");
+  if (save) {
+    const name = $("#tname").value.trim();
+    if (!name) return $("#tname").focus();
+    save.textContent = "…";
+    try {
+      const res = await fetch(`/api/clusters/${encodeURIComponent(save.dataset.uid)}/name`, {
+        method: "POST", headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({name}),
+      });
+      if (!res.ok) throw new Error(res.status);
+    } catch (err) {
+      save.textContent = "失敗";
+      return;
+    }
+    return route();
+  }
+
+  /* 参考情報の当たり外れ。押し直しで取り消せるようにしておかないと、
+     誤爆した判断がテーマノートに残り続ける */
+  const verdict = e.target.closest("button[data-verdict]");
+  if (verdict) {
+    const card = verdict.closest("[data-finding]");
+    const pressed = verdict.getAttribute("aria-pressed") === "true";
+    const value = pressed ? null : verdict.dataset.verdict;
+    const label = verdict.textContent;
+    verdict.textContent = "…";
+    try {
+      const res = await fetch(`/api/findings/${card.dataset.finding}/verdict`, {
+        method: "POST", headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({verdict: value}),
+      });
+      if (!res.ok) throw new Error(res.status);
+    } catch (err) {
+      verdict.textContent = label + "（失敗）";
+      return;
+    }
+    verdict.textContent = label;
+    card.querySelectorAll("button[data-verdict]").forEach(b =>
+      b.setAttribute("aria-pressed", b === verdict && !pressed));
+    card.classList.toggle("dropped", value === "not_useful");
     return;
   }
 

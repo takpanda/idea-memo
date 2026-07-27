@@ -451,6 +451,75 @@ class WebUI(unittest.TestCase):
 
         self.get("/api/clusters/missing-uid", expect=404)
 
+    def test_18_theme_list_can_be_reordered(self) -> None:
+        recent = self.get("/api/clusters?sort=recent")["clusters"]
+        stamps = [c["updated_at"] for c in recent]
+        self.assertEqual(stamps, sorted(stamps, reverse=True), "動いた順に並べる")
+
+        names = [c["name"] for c in self.get("/api/clusters?sort=name")["clusters"]]
+        self.assertEqual(names, sorted(names, key=str.lower))
+
+        self.get("/api/clusters?sort=bogus", expect=400)
+
+        # 一覧で見たいのは「反証が来ているか」。件数と別に数える
+        theme = self.theme_uid(PLANT[0])
+        card = next(c for c in recent if c["uid"] == theme)
+        self.assertEqual((card["findings"], card["challenges"]), (2, 1))
+
+    def test_19_dropping_a_finding_keeps_it_out_of_the_note(self) -> None:
+        theme = self.theme_uid(PLANT[0])
+        dropped = next(f for f in self.get(f"/api/clusters/{theme}")["findings"]
+                       if f["stance"] == "challenges")
+
+        res = client.post(f"/api/findings/{dropped['id']}/verdict",
+                          json={"verdict": "not_useful"})
+        self.assertEqual(res.status_code, 200, res.text)
+
+        # 判断を尊重してテーマノートからは落とす。ただし行は消さない
+        path = common.REPO_ROOT / self.db.execute(
+            "SELECT file_path FROM clusters WHERE uid = ?", (theme,)
+        ).fetchone()["file_path"]
+        self.assertNotIn(dropped["url"], path.read_text(encoding="utf-8"))
+
+        card = next(c for c in self.get("/api/clusters")["clusters"]
+                    if c["uid"] == theme)
+        self.assertEqual((card["findings"], card["challenges"]), (1, 0))
+        self.assertEqual(
+            next(f for f in self.get(f"/api/clusters/{theme}")["findings"]
+                 if f["id"] == dropped["id"])["verdict"],
+            "not_useful", "俯瞰では外したものも残す")
+
+        # 押し直しで取り消せる (誤爆がノートに残り続けない)
+        client.post(f"/api/findings/{dropped['id']}/verdict", json={"verdict": None})
+        self.assertIn(dropped["url"], path.read_text(encoding="utf-8"))
+
+        self.assertEqual(client.post(f"/api/findings/{dropped['id']}/verdict",
+                                     json={"verdict": "meh"}).status_code, 400)
+        self.assertEqual(client.post("/api/findings/999999/verdict",
+                                     json={"verdict": "useful"}).status_code, 404)
+
+    def test_20_renaming_a_theme_locks_the_name(self) -> None:
+        theme = self.theme_uid(PLANT[0])
+        res = client.post(f"/api/clusters/{theme}/name", json={"name": "ベランダの水やり"})
+        self.assertEqual(res.status_code, 200, res.text)
+
+        row = self.db.execute(
+            "SELECT name, name_locked, file_path FROM clusters WHERE uid = ?", (theme,)
+        ).fetchone()
+        self.assertEqual(row["name"], "ベランダの水やり")
+        self.assertEqual(row["name_locked"], 1, "人が付けた名前を LLM に返させない")
+
+        note = (common.REPO_ROOT / row["file_path"]).read_text(encoding="utf-8")
+        self.assertIn("ベランダの水やり", note)
+        self.assertIn("name_locked: true", note)
+
+        self.assertEqual(
+            client.post(f"/api/clusters/{theme}/name", json={"name": "  "}).status_code, 400
+        )
+        self.assertEqual(
+            client.post("/api/clusters/nope/name", json={"name": "x"}).status_code, 404
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
