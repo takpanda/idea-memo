@@ -67,7 +67,9 @@ class ThemeWriterResponseTest(unittest.TestCase):
         self.assertEqual(request.full_url, "http://ollama.example:11434/api/chat")
         body = json.loads(request.data)
         self.assertEqual(body["format"], "json")
-        self.assertTrue(body["raw"])
+        self.assertFalse(body["think"])
+        self.assertNotIn("raw", body)
+        self.assertNotIn("raw", body["options"])
         self.assertEqual(body["model"], theme_writer.LLM_MODEL)
 
     def test_ollama_ndjson_uses_message_content_from_all_chunks(self):
