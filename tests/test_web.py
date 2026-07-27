@@ -520,6 +520,38 @@ class WebUI(unittest.TestCase):
             client.post("/api/clusters/nope/name", json={"name": "x"}).status_code, 404
         )
 
+    # --- 9. テーマネットワーク --------------------------------------------
+    def test_21_cluster_network_keeps_nodes_when_vectors_are_missing(self) -> None:
+        expected = {
+            row["uid"]: row["size"]
+            for row in self.db.execute(
+                "SELECT uid, size FROM clusters WHERE closed_at IS NULL AND size > 0"
+            )
+        }
+        data = self.get("/api/clusters/network")
+        self.assertEqual({node["id"] for node in data["nodes"]}, set(expected))
+        self.assertEqual(
+            {node["id"]: node["size"] for node in data["nodes"]}, expected
+        )
+        self.assertTrue(all(node["name"] is not None for node in data["nodes"]))
+        self.assertTrue(all(node["color"].startswith("#") for node in data["nodes"]))
+        self.assertTrue(all(edge["strength"] in {"strong", "medium", "weak"}
+                            for edge in data["edges"]))
+        self.assertEqual(data["noiseNear"], [])
+
+        # 1 クラスタのベクトルが欠けても、ノードを落とさず 500 にしない。
+        cluster_id = self.db.execute(
+            "SELECT id FROM clusters WHERE closed_at IS NULL AND size > 0 LIMIT 1"
+        ).fetchone()["id"]
+        self.db.execute(
+            "DELETE FROM vec_ideas_ruri_v3_310m WHERE idea_id IN "
+            "(SELECT idea_id FROM idea_clusters WHERE cluster_id = ?)",
+            (cluster_id,),
+        )
+        self.db.commit()
+        missing = self.get("/api/clusters/network")
+        self.assertEqual({node["id"] for node in missing["nodes"]}, set(expected))
+
 
 if __name__ == "__main__":
     unittest.main()

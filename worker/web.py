@@ -17,6 +17,7 @@
 """
 
 import json
+import hashlib
 import os
 import urllib.request
 
@@ -43,6 +44,13 @@ CLUSTER_ORDER = {
     "recent": "c.updated_at DESC, c.size DESC",
     "name": "c.name COLLATE NOCASE, c.size DESC",
 }
+
+# ネットワーク図の色は DB に保存する表示状態ではないため、クラスタ UID から
+# 決定的に選ぶ。クラスタの再構成で UID が引き継がれる限り色も変わらない。
+NETWORK_COLORS = (
+    "#3d5afe", "#00897b", "#f4511e", "#8e24aa", "#6d4c41",
+    "#039be5", "#7cb342", "#d81b60",
+)
 
 app = FastAPI(title="idea-memo")
 
@@ -394,6 +402,103 @@ def clusters(sort: str = "size") -> dict:
     ).fetchone()["n"]
 
     return {"clusters": [dict(r) for r in rows], "unclustered": noise, "sort": sort}
+
+
+def _cluster_centroids(db, cluster_ids: list[int]) -> dict[int, list[float]]:
+    """クラスタごとの平均ベクトルを単位長に正規化して返す。
+
+    ベクトルはクラスタリングで使う topic 版ではなく、保存側の semantic 版を
+    使う。検索 API と同じく、保存済みベクトルがないメモは計算対象から外す。
+    平均ベクトルがゼロになる場合も、無効な重心として扱う。
+    """
+    if not cluster_ids:
+        return {}
+
+    placeholders = ",".join("?" * len(cluster_ids))
+    rows = db.execute(
+        f"""
+        SELECT ic.cluster_id, vec_to_json(v.embedding) AS vec
+        FROM   idea_clusters ic
+               JOIN {VEC_TABLE} v ON v.idea_id = ic.idea_id
+        WHERE  ic.cluster_id IN ({placeholders})
+        """,
+        cluster_ids,
+    ).fetchall()
+
+    sums: dict[int, list[float]] = {}
+    for row in rows:
+        vector = json.loads(row["vec"])
+        centroid = sums.setdefault(row["cluster_id"], [0.0] * len(vector))
+        for index, value in enumerate(vector):
+            centroid[index] += value
+
+    centroids: dict[int, list[float]] = {}
+    for cluster_id, vector in sums.items():
+        norm = sum(value * value for value in vector) ** 0.5
+        if norm:
+            centroids[cluster_id] = [value / norm for value in vector]
+    return centroids
+
+
+def _network_strength(similarity: float) -> str | None:
+    if similarity > 0.7:
+        return "strong"
+    if similarity > 0.5:
+        return "medium"
+    if similarity > 0.3:
+        return "weak"
+    return None
+
+
+@app.get("/api/clusters/network")
+def cluster_network() -> dict:
+    """開いているテーマ間の類似度をネットワーク用の形で返す。
+
+    ノードはベクトルの有無によらず返す。片方でも重心を作れないペアは
+    エッジを作らず、データ欠損を API 500 にしない。
+    """
+    db = connect(with_vec=True)
+    rows = db.execute(
+        """
+        SELECT id, uid, name, size
+        FROM   clusters
+        WHERE  closed_at IS NULL AND size > 0
+        ORDER BY size DESC, updated_at DESC
+        """
+    ).fetchall()
+
+    nodes = []
+    for row in rows:
+        digest = hashlib.sha256(row["uid"].encode("utf-8")).digest()
+        nodes.append({
+            "id": row["uid"],
+            "name": row["name"],
+            "size": row["size"],
+            "color": NETWORK_COLORS[digest[0] % len(NETWORK_COLORS)],
+        })
+
+    centroids = _cluster_centroids(db, [row["id"] for row in rows])
+    edges = []
+    for left_index, left in enumerate(rows):
+        left_vector = centroids.get(left["id"])
+        if left_vector is None:
+            continue
+        for right in rows[left_index + 1:]:
+            right_vector = centroids.get(right["id"])
+            if right_vector is None:
+                continue
+            similarity = sum(a * b for a, b in zip(left_vector, right_vector))
+            strength = _network_strength(similarity)
+            if strength:
+                edges.append({
+                    "source": left["uid"],
+                    "target": right["uid"],
+                    "strength": strength,
+                })
+
+    # ノイズに対する「近傍」の既存仕様・保存データは存在しないため、
+    # 暫定的に空配列を返す。定義が決まれば別途ベクトル検索を追加する。
+    return {"nodes": nodes, "edges": edges, "noiseNear": []}
 
 
 @app.get("/api/clusters/{uid}")
