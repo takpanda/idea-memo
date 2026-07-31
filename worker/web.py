@@ -351,16 +351,19 @@ def idea_detail(uid: str) -> dict:
         (idea_id,),
     ).fetchall()
 
-    def brief(row) -> dict:
+    def brief(row, full: bool = False) -> dict:
         item = dict(row)
-        item["snippet"] = snippet(item.pop("body"))
+        body = item.pop("body")
+        item["snippet"] = body if full else snippet(body)
         return item
 
     detail = {k: idea[k] for k in idea.keys() if k not in ("id", "parent_id")}
     return {
         "idea": detail,
         "attachments": attachments,
-        "related": [brief(r) for r in related],
+        # 類似メモのカードでは URL とタイトルを全文表示するため、本文を
+        # 省略しない。通常の返信元は一覧向けの抜粋のままにする。
+        "related": [brief(r, full=True) for r in related],
         "parent": brief(parent) if parent else None,
         "replies": [brief(r) for r in replies],
     }
@@ -690,6 +693,10 @@ INDEX = """<!doctype html>
   .meta { font-size:.8rem; color:var(--dim); display:flex; gap:.7rem; flex-wrap:wrap;
           align-items:center; }
   .body { margin:.35rem 0 0; white-space:pre-wrap; overflow-wrap:anywhere; }
+  .memo-url { display:block; margin-top:.2rem; overflow-wrap:anywhere; word-break:break-word; }
+  .memo-title { display:block; overflow-wrap:anywhere; word-break:break-word; }
+  .related-card { border-bottom:1px solid var(--line); padding:.9rem .2rem; }
+  .related-card .meta { margin-top:.35rem; }
   .full { font-size:1.05rem; margin:1rem 0 1.5rem; }
   .tag { font-size:.75rem; border:1px solid var(--line); border-radius:99px; padding:.05rem .5rem; }
   .name { color:var(--fg); font-weight:600; }
@@ -846,6 +853,17 @@ function ideaList(items, q) {
   return items.map(r => ideaCard(r, q)).join("");
 }
 
+// URL取り込みメモは本文に「URL:」「タイトル:」を保持している。
+// hrefには http(s) だけを許可し、本文由来の値をそのまま属性に入れない。
+function memoLinkParts(text) {
+  const src = String(text ?? "");
+  const urlMatch = src.match(/(?:^|\\n)URL:\\s*(https?:\\/\\/[^\\s<>"']+)/i);
+  const url = urlMatch ? urlMatch[1].replace(/[。、，,.)）」』】]+$/, "") : "";
+  const titleMatch = src.match(/(?:^|\\n)タイトル:\\s*([^\\n]+)/i);
+  const title = titleMatch ? titleMatch[1].trim() : "";
+  return {url, title};
+}
+
 // ------------------------------------------------------------
 // 画面: メモ一覧
 // ------------------------------------------------------------
@@ -895,6 +913,22 @@ async function renderIdea(uid) {
       <div class="body">${esc(r.snippet)}</div>
     </a>`;
 
+  const similarBrief = (r, label) => {
+    const {url, title} = memoLinkParts(r.snippet);
+    const detail = `#/ideas/${encodeURIComponent(r.uid)}`;
+    const content = url
+      ? `<a class="memo-title" href="${esc(url)}" target="_blank" rel="noreferrer">${esc(title || url)}</a>
+         <a class="memo-url" href="${esc(url)}" target="_blank" rel="noreferrer">${esc(url)}</a>`
+      : `<div class="body">${esc(r.snippet)}</div>`;
+    return `
+      <div class="related-card">
+        <div class="meta"><a href="${detail}">メモを開く</a>
+          <span>${fmtDay(r.captured_at)}</span>
+          ${label ? `<span class="tag">${esc(label)}</span>` : ""}</div>
+        ${content}
+      </div>`;
+  };
+
   const attachments = d.attachments.map(a =>
     `<span class="tag">${a.kind}${a.duration ? ` ${a.duration}s` : ""}</span>`).join(" ");
 
@@ -919,7 +953,7 @@ async function renderIdea(uid) {
     ${d.parent ? "<h2>返信元</h2>" + brief(d.parent) : ""}
     ${d.replies.length ? "<h2>追記</h2>" + d.replies.map(r => brief(r)).join("") : ""}
     ${d.related.length
-      ? "<h2>関連メモ</h2>" + d.related.map(r => brief(r, r.kind)).join("")
+      ? "<h2>似ているメモ " + d.related.length + " 件</h2>" + d.related.map(r => similarBrief(r, r.kind)).join("")
       : ""}
     <p class="meta" style="margin-top:2rem">${esc(i.file_path)}</p>`);
 }
