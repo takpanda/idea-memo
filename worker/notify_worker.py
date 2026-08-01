@@ -15,6 +15,7 @@
 
 import logging
 import os
+import re
 import time
 import urllib.error
 
@@ -39,6 +40,21 @@ MARKS = ["①", "②", "③"]
 def snippet(body: str, length: int = SNIPPET_LEN) -> str:
     flat = " ".join(body.split())
     return flat[:length] + ("…" if len(flat) > length else "")
+
+
+def memo_link_parts(body: str) -> tuple[str, str]:
+    """URL取り込みメモから、表示用のURLとタイトルを取り出す。
+
+    telegram_ingest が保存する ``URL:`` / ``タイトル:`` の行だけを対象に
+    する。URLを含まない従来のメモは空のURLを返し、呼び出し側で snippet()
+    にフォールバックする。
+    """
+    src = str(body or "")
+    url_match = re.search(r"(?:^|\n)URL:\s*(https?://[^\s<>\"']+)", src, re.IGNORECASE)
+    url = url_match.group(1).rstrip("。、，,.)）」』】") if url_match else ""
+    title_match = re.search(r"(?:^|\n)タイトル:\s*([^\n]+)", src, re.IGNORECASE)
+    title = title_match.group(1).strip() if title_match else ""
+    return url, title
 
 
 # ------------------------------------------------------------
@@ -139,7 +155,13 @@ def notify_similar(idea, matches: list[dict]) -> None:
     keyboard = []
     for mark, match in zip(MARKS, matches):
         lines.append(f"{mark} {match['captured_at'][:10]} · {match['score']:.0%}")
-        lines.append(snippet(match["body"]))
+        url, title = memo_link_parts(match["body"])
+        if url:
+            if title:
+                lines.append(f"タイトル: {title}")
+            lines.append(f"URL: {url}")
+        else:
+            lines.append(snippet(match["body"]))
         lines.append("")
         base = f"rel:{idea['id']}:{match['id']}"
         pct = round(match["score"] * 100)
