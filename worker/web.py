@@ -1155,10 +1155,9 @@ function forceGraph(container, { nodes, links, width, height }) {
         d.fx = event.x;
         d.fy = event.y;
       })
-      .on('end', (event, d) => {
+      .on('end', (event) => {
         if (!event.active) simulation.alphaTarget(0);
-        d.fx = null;
-        d.fy = null;
+        // d.fx / d.fy は解放せず、ページを開いている間は位置を保持する。
       }))
     .on('click', (event, d) => {
       if (event.defaultPrevented) return;  // drag時は無視
